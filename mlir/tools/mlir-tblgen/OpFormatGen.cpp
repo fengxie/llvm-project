@@ -1857,7 +1857,7 @@ static void genCustomDirectiveParameterPrinter(FormatElement *element,
     body << "getOperation()->getAttrDictionary()";
 
   } else if (isa<PropDictDirective>(element)) {
-    body << "getOperation()->getPropertiesStorage()";
+    body << "getProperties()";
 
   } else if (auto *operand = dyn_cast<OperandVariable>(element)) {
     body << op.getGetterName(operand->getVar()->name) << "()";

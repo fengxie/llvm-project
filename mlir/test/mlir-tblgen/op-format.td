@@ -45,7 +45,7 @@ def CustomStringLiteralC : TestFormat_Op<[{
 // CHECK-LABEL: CustomStringLiteralD::parse
 // CHECK: parseFoo({{.*}}, result)
 // CHECK-LABEL: CustomStringLiteralD::print
-// CHECK: printFoo({{.*}}, getOperation()->getPropertiesStorage())
+// CHECK: printFoo({{.*}}, getProperties())
 def CustomStringLiteralD : TestFormat_Op<[{
   custom<Foo>(prop-dict) attr-dict
 }]>;
