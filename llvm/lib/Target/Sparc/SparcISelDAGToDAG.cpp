@@ -10,13 +10,11 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "SparcSelectionDAGInfo.h"
 #include "SparcTargetMachine.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/SelectionDAGISel.h"
-#include "llvm/IR/Intrinsics.h"
-#include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
-#include "llvm/Support/raw_ostream.h"
 using namespace llvm;
 
 #define DEBUG_TYPE "sparc-isel"
@@ -35,12 +33,11 @@ class SparcDAGToDAGISel : public SelectionDAGISel {
   /// Subtarget - Keep a pointer to the Sparc Subtarget around so that we can
   /// make the right decision when generating code for different targets.
   const SparcSubtarget *Subtarget = nullptr;
-public:
-  static char ID;
 
+public:
   SparcDAGToDAGISel() = delete;
 
-  explicit SparcDAGToDAGISel(SparcTargetMachine &tm) : SelectionDAGISel(ID, tm) {}
+  explicit SparcDAGToDAGISel(SparcTargetMachine &tm) : SelectionDAGISel(tm) {}
 
   bool runOnMachineFunction(MachineFunction &MF) override {
     Subtarget = &MF.getSubtarget<SparcSubtarget>();
@@ -52,6 +49,7 @@ public:
   // Complex Pattern Selectors.
   bool SelectADDRrr(SDValue N, SDValue &R1, SDValue &R2);
   bool SelectADDRri(SDValue N, SDValue &Base, SDValue &Offset);
+  bool SelectForceADDRrr(SDValue N, SDValue &Base, SDValue &Disp);
 
   /// SelectInlineAsmMemoryOperand - Implement addressing mode selection for
   /// inline asm expressions.
@@ -66,11 +64,18 @@ private:
   SDNode* getGlobalBaseReg();
   bool tryInlineAsm(SDNode *N);
 };
+
+class SparcDAGToDAGISelLegacy : public SelectionDAGISelLegacy {
+public:
+  static char ID;
+  explicit SparcDAGToDAGISelLegacy(SparcTargetMachine &tm)
+      : SelectionDAGISelLegacy(ID, std::make_unique<SparcDAGToDAGISel>(tm)) {}
+};
 }  // end anonymous namespace
 
-char SparcDAGToDAGISel::ID = 0;
+char SparcDAGToDAGISelLegacy::ID = 0;
 
-INITIALIZE_PASS(SparcDAGToDAGISel, DEBUG_TYPE, PASS_NAME, false, false)
+INITIALIZE_PASS(SparcDAGToDAGISelLegacy, DEBUG_TYPE, PASS_NAME, false, false)
 
 SDNode* SparcDAGToDAGISel::getGlobalBaseReg() {
   Register GlobalBaseReg = Subtarget->getInstrInfo()->getGlobalBaseReg(MF);
@@ -103,8 +108,8 @@ bool SparcDAGToDAGISel::SelectADDRri(SDValue Addr,
         } else {
           Base = Addr.getOperand(0);
         }
-        Offset = CurDAG->getTargetConstant(CN->getZExtValue(), SDLoc(Addr),
-                                           MVT::i32);
+        Offset = CurDAG->getSignedTargetConstant(CN->getSExtValue(),
+                                                 SDLoc(Addr), MVT::i32);
         return true;
       }
     }
@@ -148,6 +153,18 @@ bool SparcDAGToDAGISel::SelectADDRrr(SDValue Addr, SDValue &R1, SDValue &R2) {
   return true;
 }
 
+bool SparcDAGToDAGISel::SelectForceADDRrr(SDValue Addr, SDValue &Base,
+                                          SDValue &Disp) {
+  if (SelectADDRrr(Addr, Base, Disp))
+    return true;
+
+  // Otherwise we'll use the full address in base and set the offset part to
+  // zero.
+  Base = Addr;
+  Disp =
+      CurDAG->getRegister(SP::G0, TLI->getPointerTy(CurDAG->getDataLayout()));
+  return true;
+}
 
 // Re-assemble i64 arguments split up in SelectionDAGBuilder's
 // visitInlineAsm / GetRegistersForValue functions.
@@ -397,5 +414,5 @@ bool SparcDAGToDAGISel::SelectInlineAsmMemoryOperand(
 /// SPARC-specific DAG, ready for instruction scheduling.
 ///
 FunctionPass *llvm::createSparcISelDag(SparcTargetMachine &TM) {
-  return new SparcDAGToDAGISel(TM);
+  return new SparcDAGToDAGISelLegacy(TM);
 }

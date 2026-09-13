@@ -2,7 +2,7 @@
 
 func.func @alloc_tensor_missing_dims(%arg0: index)
 {
-  // expected-error @+1 {{expected 2 dynamic sizes}}
+  // expected-error @+1 {{incorrect number of dynamic sizes, has 1, expected 2}}
   %0 = bufferization.alloc_tensor(%arg0) : tensor<4x?x?x5xf32>
   return
 }
@@ -26,6 +26,14 @@ func.func @alloc_tensor_copy_and_dims(%t: tensor<?xf32>, %sz: index) {
 
 // -----
 
+func.func @alloc_tensor_memory_space_in_attr_dict() {
+  // expected-error@+1 {{inherent attribute 'memory_space' cannot be parsed from attr-dict when strict properties in assembly format is enabled}}
+  %0 = bufferization.alloc_tensor() {memory_space = "foo"} : tensor<4xf32>
+  return
+}
+
+// -----
+
 // expected-error @+1{{invalid value for 'bufferization.access'}}
 func.func private @invalid_buffer_access_type(tensor<*xf32> {bufferization.access = "foo"})
 
@@ -43,9 +51,16 @@ func.func @invalid_writable_on_op() {
 
 // -----
 
-func.func @invalid_materialize_in_destination(%arg0: tensor<?xf32>, %arg1: tensor<5xf32>) {
-  // expected-error @below{{failed to verify that all of {source, dest} have same shape}}
-  bufferization.materialize_in_destination %arg0 in %arg1 : (tensor<?xf32>, tensor<5xf32>) -> tensor<5xf32>
+func.func @invalid_materialize_in_destination(%arg0: tensor<4xf32>, %arg1: tensor<5xf32>) {
+  // expected-error @below{{source/destination shapes are incompatible}}
+  bufferization.materialize_in_destination %arg0 in %arg1 : (tensor<4xf32>, tensor<5xf32>) -> tensor<5xf32>
+}
+
+// -----
+
+func.func @invalid_materialize_in_destination(%arg0: tensor<5x5xf32>, %arg1: tensor<5xf32>) {
+  // expected-error @below{{'bufferization.materialize_in_destination' op source rank (2) does not match destination rank (1)}}
+  bufferization.materialize_in_destination %arg0 in %arg1 : (tensor<5x5xf32>, tensor<5xf32>) -> tensor<5xf32>
 }
 
 // -----
@@ -119,4 +134,64 @@ func.func @invalid_dealloc_wrong_number_of_results(%arg0: memref<2xf32>, %arg1: 
 func.func @invalid_manual_deallocation() {
   // expected-error @below{{op attribute 'bufferization.manual_deallocation' can be used only on ops that have an allocation and/or free side effect}}
   arith.constant {bufferization.manual_deallocation} 0  : index
+}
+
+// -----
+
+func.func @invalid_rank_to_buffer(%t: tensor<1x2x3x4xf32>) {
+  // expected-error @below{{'bufferization.to_buffer' op failed to verify that specified tensor and buffer types match}}
+  // expected-error @below{{shapes do not match}}
+  %b = bufferization.to_buffer %t
+    : tensor<1x2x3x4xf32> to memref<1x2x3xf32>
+  return
+}
+
+// -----
+
+func.func @invalid_rank_to_tensor(%b: memref<1x2x3xf32>) {
+  // expected-error @below{{'bufferization.to_tensor' op failed to verify that specified tensor and buffer types match}}
+  // expected-error @below{{shapes do not match}}
+  %t = bufferization.to_tensor %b
+    : memref<1x2x3xf32> to tensor<1x2x3x4xf32>
+  return
+}
+
+// -----
+
+func.func @invalid_shape_to_buffer(%t: tensor<1x2x3x4xf32>) {
+  // expected-error @below{{'bufferization.to_buffer' op failed to verify that specified tensor and buffer types match}}
+  // expected-error @below{{shapes do not match}}
+  %b = bufferization.to_buffer %t
+    : tensor<1x2x3x4xf32> to memref<1x2x4x3xf32>
+  return
+}
+
+// -----
+
+func.func @invalid_shape_to_tensor(%b: memref<1x2x4x3xf32>) {
+  // expected-error @below{{'bufferization.to_tensor' op failed to verify that specified tensor and buffer types match}}
+  // expected-error @below{{shapes do not match}}
+  %t = bufferization.to_tensor %b
+    : memref<1x2x4x3xf32> to tensor<1x2x3x4xf32>
+  return
+}
+
+// -----
+
+func.func @invalid_type_to_buffer(%t: tensor<1x2x3x4xf32>) {
+  // expected-error @below{{'bufferization.to_buffer' op failed to verify that specified tensor and buffer types match}}
+  // expected-error @below{{element types do not match}}
+  %b = bufferization.to_buffer %t
+    : tensor<1x2x3x4xf32> to memref<1x2x3x4xf16>
+  return
+}
+
+// -----
+
+func.func @invalid_type_to_tensor(%b: memref<1x2x3x4xf16>) {
+  // expected-error @below{{'bufferization.to_tensor' op failed to verify that specified tensor and buffer types match}}
+  // expected-error @below{{element types do not match}}
+  %t2 = bufferization.to_tensor %b
+    : memref<1x2x3x4xf16> to tensor<1x2x3x4xf32>
+  return
 }

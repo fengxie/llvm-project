@@ -17,6 +17,20 @@ namespace PR31692 {
   static_assert(__is_constructible(A::X), "");
 }
 
+namespace PR215166 {
+  // Same as above, but with a class template.
+  struct A {
+    template<typename T> struct X { int n = 0; };
+    X<int> x;
+    // Trigger construction of X<int>() from a SFINAE context. This must not mark
+    // any part of X<int> as invalid.
+    static_assert(!__is_constructible(X<int>), "");
+    // Check that X<int>::n is not marked invalid.
+    double &r = x.n; // expected-error {{non-const lvalue reference to type 'double' cannot bind to a value of unrelated type 'int'}}
+  };
+  // A::X can now be default-constructed.
+  static_assert(__is_constructible(A::X<int>), "");
+}
 
 struct S {
 } constexpr s;
@@ -55,6 +69,9 @@ public:
 } // namespace std
 
 #if __cplusplus >= 201703L
+
+// Test CXXDefaultInitExpr rebuild issue in 
+// https://github.com/llvm/llvm-project/pull/87933
 namespace test_rebuild {
 template <typename T, int> class C {
 public:
@@ -70,8 +87,6 @@ public:
 };
 
 struct B : A {
-  // Test CXXDefaultInitExpr rebuild issue in 
-  // https://github.com/llvm/llvm-project/pull/87933
   int *ar = some_func<int>(C{some_func<int>(0)});
   B() {}
 };
@@ -99,6 +114,28 @@ void TypeTest_Element_Test::TestBody() {
   &TestBody_got != expect; // expected-warning {{inequality comparison result unused}}
 }
 } //  namespace test_rebuild
+
+// Test CXXDefaultInitExpr rebuild issue in 
+// https://github.com/llvm/llvm-project/pull/92527
+namespace test_rebuild2 {
+struct F {
+  int g;
+};
+struct H {};
+struct I {
+  I(const F &);
+  I(H);
+};
+struct L {
+  I i = I({.g = 0});
+};
+struct N : L {};
+
+void f() {
+  delete new L; // Ok
+  delete new N; // Ok
+}
+} // namespace test_rebuild2
 #endif // __cplusplus >= 201703L
 
 #if __cplusplus >= 202002L

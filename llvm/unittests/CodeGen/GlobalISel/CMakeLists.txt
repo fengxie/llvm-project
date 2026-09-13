@@ -1,5 +1,7 @@
 set(LLVM_LINK_COMPONENTS
   ${LLVM_TARGETS_TO_BUILD}
+  Analysis
+  AsmParser
   CodeGen
   CodeGenTypes
   Core
@@ -13,6 +15,7 @@ set(LLVM_LINK_COMPONENTS
   )
 
 add_llvm_unittest(GlobalISelTests
+  IRTranslatorBF16Test.cpp
   ConstantFoldingTest.cpp
   CSETest.cpp
   GIMatchTableExecutorTest.cpp
@@ -23,7 +26,10 @@ add_llvm_unittest(GlobalISelTests
   GISelMITest.cpp
   PatternMatchTest.cpp
   KnownBitsTest.cpp
+  KnownFPClassTest.cpp
   KnownBitsVectorTest.cpp
   GISelUtilsTest.cpp
   GISelAliasTest.cpp
+  CallLowering.cpp
+  InstructionSelectTest.cpp
   )

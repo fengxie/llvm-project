@@ -18,7 +18,9 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
-#include "llvm/Transforms/Utils/Local.h"
+#include "llvm/Analysis/BranchProbabilityInfo.h"
+#include "llvm/Analysis/DomTreeUpdater.h"
+#include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
@@ -27,13 +29,13 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
-#include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Value.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/KnownBits.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/Transforms/Utils/Local.h"
 #include <cassert>
-#include <cstdint>
 
 using namespace llvm;
 
@@ -41,22 +43,22 @@ using namespace llvm;
 
 namespace {
 
-  struct QuotRemPair {
-    Value *Quotient;
-    Value *Remainder;
+struct QuotRemPair {
+  Value *Quotient;
+  Value *Remainder;
 
-    QuotRemPair(Value *InQuotient, Value *InRemainder)
-        : Quotient(InQuotient), Remainder(InRemainder) {}
-  };
+  QuotRemPair(Value *InQuotient, Value *InRemainder)
+      : Quotient(InQuotient), Remainder(InRemainder) {}
+};
 
-  /// A quotient and remainder, plus a BB from which they logically "originate".
-  /// If you use Quotient or Remainder in a Phi node, you should use BB as its
-  /// corresponding predecessor.
-  struct QuotRemWithBB {
-    BasicBlock *BB = nullptr;
-    Value *Quotient = nullptr;
-    Value *Remainder = nullptr;
-  };
+/// A quotient and remainder, plus a BB from which they logically "originate".
+/// If you use Quotient or Remainder in a Phi node, you should use BB as its
+/// corresponding predecessor.
+struct QuotRemWithBB {
+  BasicBlock *BB = nullptr;
+  Value *Quotient = nullptr;
+  Value *Remainder = nullptr;
+};
 
 using DivCacheTy = DenseMap<DivRemMapKey, QuotRemPair>;
 using BypassWidthsTy = DenseMap<unsigned, unsigned>;
@@ -77,7 +79,11 @@ class FastDivInsertionTask {
   Instruction *SlowDivOrRem = nullptr;
   IntegerType *BypassType = nullptr;
   BasicBlock *MainBB = nullptr;
+  DomTreeUpdater *DTU = nullptr;
+  LoopInfo *LI = nullptr;
+  BranchProbabilityInfo *BPI = nullptr;
 
+  BasicBlock *splitMainBB();
   bool isHashLikeValue(Value *V, VisitedSetTy &Visited);
   ValueRange getValueRange(Value *Op, VisitedSetTy &Visited);
   QuotRemWithBB createSlowBB(BasicBlock *Successor);
@@ -100,7 +106,9 @@ class FastDivInsertionTask {
   Type *getSlowType() { return SlowDivOrRem->getType(); }
 
 public:
-  FastDivInsertionTask(Instruction *I, const BypassWidthsTy &BypassWidths);
+  FastDivInsertionTask(Instruction *I, const BypassWidthsTy &BypassWidths,
+                       DomTreeUpdater *DTU, LoopInfo *LI,
+                       BranchProbabilityInfo *BPI);
 
   Value *getReplacement(DivCacheTy &Cache);
 };
@@ -108,7 +116,10 @@ public:
 } // end anonymous namespace
 
 FastDivInsertionTask::FastDivInsertionTask(Instruction *I,
-                                           const BypassWidthsTy &BypassWidths) {
+                                           const BypassWidthsTy &BypassWidths,
+                                           DomTreeUpdater *DTU, LoopInfo *LI,
+                                           BranchProbabilityInfo *BPI)
+    : DTU(DTU), LI(LI), BPI(BPI) {
   switch (I->getOpcode()) {
   case Instruction::UDiv:
   case Instruction::SDiv:
@@ -233,7 +244,7 @@ ValueRange FastDivInsertionTask::getValueRange(Value *V,
   assert(LongLen > ShortLen && "Value type must be wider than BypassType");
   unsigned HiBits = LongLen - ShortLen;
 
-  const DataLayout &DL = SlowDivOrRem->getModule()->getDataLayout();
+  const DataLayout &DL = SlowDivOrRem->getDataLayout();
   KnownBits Known(LongLen);
 
   computeKnownBits(V, Known, DL);
@@ -252,6 +263,24 @@ ValueRange FastDivInsertionTask::getValueRange(Value *V,
     return VALRNG_LIKELY_LONG;
 
   return VALRNG_UNKNOWN;
+}
+
+// Split MainBB and keep BPI up-to-date if its present.
+BasicBlock *FastDivInsertionTask::splitMainBB() {
+  SmallVector<BranchProbability, 4> ExitProbs;
+  if (BPI)
+    for (unsigned I = 0, E = MainBB->getTerminator()->getNumSuccessors();
+         I != E; ++I)
+      ExitProbs.push_back(BPI->getEdgeProbability(MainBB, I));
+
+  BasicBlock *SuccessorBB = SplitBlock(MainBB, SlowDivOrRem, DTU, LI);
+  MainBB->back().eraseFromParent();
+
+  if (BPI) {
+    BPI->setEdgeProbability(SuccessorBB, ExitProbs);
+    BPI->eraseBlock(MainBB);
+  }
+  return SuccessorBB;
 }
 
 /// Add new basic block for slow div and rem operations and put it before
@@ -336,10 +365,10 @@ Value *FastDivInsertionTask::insertOperandRuntimeCheck(Value *Op1, Value *Op2) {
   else
     OrV = Op1 ? Op1 : Op2;
 
-  // BitMask is inverted to check if the operands are
-  // larger than the bypass type
-  uint64_t BitMask = ~BypassType->getBitMask();
-  Value *AndV = Builder.CreateAnd(OrV, BitMask);
+  // Check whether the operands are larger than the bypass type.
+  Value *AndV = Builder.CreateAnd(
+      OrV, APInt::getBitsSetFrom(OrV->getType()->getIntegerBitWidth(),
+                                 BypassType->getBitWidth()));
 
   // Compare operand values
   Value *ZeroV = ConstantInt::getSigned(getSlowType(), 0);
@@ -413,9 +442,7 @@ std::optional<QuotRemPair> FastDivInsertionTask::insertFastDivAndRem() {
     // lets us entirely avoid a long div.
 
     // Split the basic block before the div/rem.
-    BasicBlock *SuccessorBB = MainBB->splitBasicBlock(SlowDivOrRem);
-    // Remove the unconditional branch from MainBB to SuccessorBB.
-    MainBB->back().eraseFromParent();
+    BasicBlock *SuccessorBB = splitMainBB();
     QuotRemWithBB Long;
     Long.BB = MainBB;
     Long.Quotient = ConstantInt::get(getSlowType(), 0);
@@ -424,29 +451,50 @@ std::optional<QuotRemPair> FastDivInsertionTask::insertFastDivAndRem() {
     QuotRemPair Result = createDivRemPhiNodes(Fast, Long, SuccessorBB);
     Value *CmpV = Builder.CreateICmpUGE(Dividend, Divisor);
     Builder.CreateCondBr(CmpV, Fast.BB, SuccessorBB);
-    return Result;
-  } else {
-    // General case. Create both slow and fast div/rem pairs and choose one of
-    // them at runtime.
 
-    // Split the basic block before the div/rem.
-    BasicBlock *SuccessorBB = MainBB->splitBasicBlock(SlowDivOrRem);
-    // Remove the unconditional branch from MainBB to SuccessorBB.
-    MainBB->back().eraseFromParent();
-    QuotRemWithBB Fast = createFastBB(SuccessorBB);
-    QuotRemWithBB Slow = createSlowBB(SuccessorBB);
-    QuotRemPair Result = createDivRemPhiNodes(Fast, Slow, SuccessorBB);
-    Value *CmpV = insertOperandRuntimeCheck(DividendShort ? nullptr : Dividend,
-                                            DivisorShort ? nullptr : Divisor);
-    Builder.CreateCondBr(CmpV, Fast.BB, Slow.BB);
+    if (DTU)
+      DTU->applyUpdates({{DominatorTree::Insert, MainBB, Fast.BB},
+                         {DominatorTree::Insert, Fast.BB, SuccessorBB}});
+    if (LI) {
+      if (Loop *L = LI->getLoopFor(MainBB))
+        L->addBasicBlockToLoop(Fast.BB, *LI);
+    }
+
     return Result;
   }
+
+  // General case. Create both slow and fast div/rem pairs and choose one of
+  // them at runtime.
+
+  // Split the basic block before the div/rem.
+  BasicBlock *SuccessorBB = splitMainBB();
+  QuotRemWithBB Fast = createFastBB(SuccessorBB);
+  QuotRemWithBB Slow = createSlowBB(SuccessorBB);
+  QuotRemPair Result = createDivRemPhiNodes(Fast, Slow, SuccessorBB);
+  Value *CmpV = insertOperandRuntimeCheck(DividendShort ? nullptr : Dividend,
+                                          DivisorShort ? nullptr : Divisor);
+  Builder.CreateCondBr(CmpV, Fast.BB, Slow.BB);
+  if (DTU)
+    DTU->applyUpdates({{DominatorTree::Insert, MainBB, Fast.BB},
+                       {DominatorTree::Insert, MainBB, Slow.BB},
+                       {DominatorTree::Insert, Fast.BB, SuccessorBB},
+                       {DominatorTree::Insert, Slow.BB, SuccessorBB},
+                       {DominatorTree::Delete, MainBB, SuccessorBB}});
+  if (LI) {
+    if (Loop *L = LI->getLoopFor(MainBB)) {
+      L->addBasicBlockToLoop(Fast.BB, *LI);
+      L->addBasicBlockToLoop(Slow.BB, *LI);
+    }
+  }
+  return Result;
 }
 
 /// This optimization identifies DIV/REM instructions in a BB that can be
 /// profitably bypassed and carried out with a shorter, faster divide.
 bool llvm::bypassSlowDivision(BasicBlock *BB,
-                              const BypassWidthsTy &BypassWidths) {
+                              const BypassWidthsTy &BypassWidths,
+                              DomTreeUpdater *DTU, LoopInfo *LI,
+                              BranchProbabilityInfo *BPI) {
   DivCacheTy PerBBDivCache;
 
   bool MadeChange = false;
@@ -458,10 +506,10 @@ bool llvm::bypassSlowDivision(BasicBlock *BB,
     Next = Next->getNextNode();
 
     // Ignore dead code to save time and avoid bugs.
-    if (I->hasNUses(0))
+    if (I->use_empty())
       continue;
 
-    FastDivInsertionTask Task(I, BypassWidths);
+    FastDivInsertionTask Task(I, BypassWidths, DTU, LI, BPI);
     if (Value *Replacement = Task.getReplacement(PerBBDivCache)) {
       I->replaceAllUsesWith(Replacement);
       I->eraseFromParent();

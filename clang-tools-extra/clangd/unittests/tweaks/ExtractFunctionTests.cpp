@@ -24,8 +24,8 @@ TEST_F(ExtractFunctionTest, FunctionTest) {
 
   // Root statements should have common parent.
   EXPECT_EQ(apply("for(;;) [[1+2; 1+2;]]"), "unavailable");
-  // Expressions aren't extracted.
-  EXPECT_EQ(apply("int x = 0; [[x++;]]"), "unavailable");
+  // Single expression-statements can be extracted.
+  EXPECT_THAT(apply("int x = 0; [[x++;]]"), HasSubstr("extracted"));
   // We don't support extraction from lambdas.
   EXPECT_EQ(apply("auto lam = [](){ [[int x;]] }; "), "unavailable");
   // Partial statements aren't extracted.
@@ -190,6 +190,18 @@ F (extracted();)
     }]]
   )cpp";
   EXPECT_EQ(apply(CompoundFailInput), "unavailable");
+
+  ExtraArgs.push_back("-std=c++14");
+  // A bare expression-statement can be extracted (the semicolon isn't part
+  // of the selection either way, since it isn't owned by any AST node).
+  EXPECT_THAT(apply(R"cpp(
+                void call() { [[1+1]]; }
+            )cpp"),
+              HasSubstr("extracted"));
+  EXPECT_THAT(apply(R"cpp(
+                void call() { [[1+1;]] }
+            )cpp"),
+              HasSubstr("extracted"));
 }
 
 TEST_F(ExtractFunctionTest, DifferentHeaderSourceTest) {
@@ -569,6 +581,101 @@ int getNum(bool Superstitious, int Min, int Max) {
     }
   )cpp";
   EXPECT_EQ(apply(Before), After);
+}
+
+TEST_F(ExtractFunctionTest, OverloadedOperators) {
+  Context = File;
+  std::string Before = R"cpp(struct A {
+                int operator+(int x) { return x; }
+              };
+              A &operator<<(A &, int);
+              A &operator|(A &, int);
+
+              A stream{};
+
+              void foo(int, int);
+
+              int main() {
+                [[foo(1, 2);
+                foo(3, 4);
+                stream << 42;
+                stream + 42;
+                stream | 42;
+                foo(1, 2);
+                foo(3, 4);]]
+              })cpp";
+  std::string After =
+      R"cpp(struct A {
+                int operator+(int x) { return x; }
+              };
+              A &operator<<(A &, int);
+              A &operator|(A &, int);
+
+              A stream{};
+
+              void foo(int, int);
+
+              void extracted() {
+foo(1, 2);
+                foo(3, 4);
+                stream << 42;
+                stream + 42;
+                stream | 42;
+                foo(1, 2);
+                foo(3, 4);
+}
+int main() {
+                extracted();
+              })cpp";
+  EXPECT_EQ(apply(Before), After);
+}
+
+TEST_F(ExtractFunctionTest, SingleStatement) {
+  Context = File;
+  // https://github.com/clangd/clangd/issues/698
+  // A single call-expression-statement can be extracted.
+  EXPECT_THAT(apply(R"cpp(
+    void foo(int, int);
+    void bar() {
+      [[foo(1, 2);]]
+    })cpp"),
+              HasSubstr("extracted"));
+  // https://github.com/clangd/clangd/issues/1254
+  // A single statement consisting of an overloaded binary operator call can
+  // be extracted, even though the SelectionTree marks the
+  // CXXOperatorCallExpr itself as Unselected (its operands claim all the
+  // characters).
+  EXPECT_THAT(apply(R"cpp(
+    struct Stream {};
+    Stream &operator<<(Stream &, const char *);
+    Stream stream;
+    int main() {
+      [[stream << "x";]]
+    })cpp"),
+              HasSubstr("extracted"));
+  // Selecting a subexpression of an operator call (rather than the whole
+  // statement) must not be extracted: it is not a standalone statement, and
+  // "extracting" it would replace only part of the expression.
+  EXPECT_EQ(apply(R"cpp(
+    struct Stream {};
+    Stream &operator<<(Stream &, int);
+    Stream stream;
+    void test() {
+      stream << [[3]];
+    })cpp"),
+            "unavailable");
+  // Same as above, but the selected subexpression is itself an
+  // (Unselected-but-fully-covered) CXXOperatorCallExpr nested as an argument
+  // of an outer call, rather than a Complete leaf expression.
+  EXPECT_EQ(apply(R"cpp(
+    struct Stream {};
+    Stream &operator<<(Stream &, int);
+    void foo(Stream &, int);
+    Stream stream;
+    void test() {
+      foo([[stream << 3]], 4);
+    })cpp"),
+            "unavailable");
 }
 
 } // namespace

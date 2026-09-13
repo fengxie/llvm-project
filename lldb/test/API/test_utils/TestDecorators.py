@@ -1,7 +1,9 @@
 import re
+import unittest
 
 from lldbsuite.test.lldbtest import TestBase
 from lldbsuite.test.decorators import *
+from lldbsuite.test.skip_reason import UnsupportedReason, is_unsupported
 
 
 def expectedFailureDwarf(bugnumber=None):
@@ -29,7 +31,7 @@ class TestDecoratorsNoDebugInfoClass(TestBase):
         self.assertIsNone(self.getDebugInfo())
 
     @expectedFailureAll
-    def test_xfail_regexp(self):
+    def test_xfail_empty(self):
         """Test that expectedFailureAll can be empty (but please just use expectedFailure)"""
         self.fail()
 
@@ -92,7 +94,7 @@ class TestDecorators(TestBase):
         # self.assertNotEqual(self.getDebugInfo(), "dwarf")
 
     @expectedFailureAll
-    def test_xfail_regexp(self):
+    def test_xfail_empty(self):
         """Test that xfail can be empty"""
         self.fail()
 
@@ -113,3 +115,11 @@ class TestDecorators(TestBase):
     @expectedFailureIf(condition=False)
     def test_xfail_condition_false(self):
         pass
+
+    def test_unsupported_reason_survives_skip_test(self):
+        """A runtime skipTest(UnsupportedReason(...)) must report UNSUPPORTED."""
+        try:
+            self.skipTest(UnsupportedReason("probe"))
+        except unittest.SkipTest as skip:
+            self.assertTrue(is_unsupported(self, str(skip)))
+        self._skipped_as_unsupported = False  # this test passes, don't mark it

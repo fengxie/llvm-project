@@ -10,7 +10,6 @@
 #include "../clang-tidy/ClangTidyCheck.h"
 #include "../clang-tidy/ClangTidyDiagnosticConsumer.h"
 #include "../clang-tidy/ClangTidyModule.h"
-#include "../clang-tidy/ClangTidyModuleRegistry.h"
 #include "../clang-tidy/ClangTidyOptions.h"
 #include "AST.h"
 #include "CollectMacros.h"
@@ -20,7 +19,6 @@
 #include "Feature.h"
 #include "FeatureModule.h"
 #include "Headers.h"
-#include "HeuristicResolver.h"
 #include "IncludeCleaner.h"
 #include "IncludeFixer.h"
 #include "Preamble.h"
@@ -52,7 +50,9 @@
 #include "clang/Frontend/PrecompiledPreamble.h"
 #include "clang/Lex/Lexer.h"
 #include "clang/Lex/PPCallbacks.h"
+#include "clang/Lex/PreprocessingRecord.h"
 #include "clang/Lex/Preprocessor.h"
+#include "clang/Sema/HeuristicResolver.h"
 #include "clang/Serialization/ASTWriter.h"
 #include "clang/Tooling/CompilationDatabase.h"
 #include "clang/Tooling/Core/Diagnostic.h"
@@ -81,6 +81,11 @@
 #if CLANGD_TIDY_CHECKS
 #define CLANG_TIDY_DISABLE_STATIC_ANALYZER_CHECKS
 #include "../clang-tidy/ClangTidyForceLinker.h"
+#endif
+
+#if CLANG_TIDY_ENABLE_QUERY_BASED_CUSTOM_CHECKS
+#include "../clang-tidy/ClangTidy.h"
+#include <mutex>
 #endif
 
 namespace clang {
@@ -143,7 +148,8 @@ public:
   // Attach preprocessor hooks such that preamble events will be injected at
   // the appropriate time.
   // Events will be delivered to the *currently registered* PP callbacks.
-  static void attach(std::vector<Inclusion> Includes, CompilerInstance &Clang,
+  static void attach(std::vector<Inclusion> Includes,
+                     const MainFileMacros Macros, CompilerInstance &Clang,
                      const PreambleBounds &PB) {
     auto &PP = Clang.getPreprocessor();
     auto *ExistingCallbacks = PP.getPPCallbacks();
@@ -151,8 +157,8 @@ public:
     if (!ExistingCallbacks)
       return;
     PP.addPPCallbacks(std::unique_ptr<PPCallbacks>(new ReplayPreamble(
-        std::move(Includes), ExistingCallbacks, Clang.getSourceManager(), PP,
-        Clang.getLangOpts(), PB)));
+        std::move(Includes), std::move(Macros), ExistingCallbacks,
+        Clang.getSourceManager(), PP, Clang.getLangOpts(), PB)));
     // We're relying on the fact that addPPCallbacks keeps the old PPCallbacks
     // around, creating a chaining wrapper. Guard against other implementations.
     assert(PP.getPPCallbacks() != ExistingCallbacks &&
@@ -160,10 +166,12 @@ public:
   }
 
 private:
-  ReplayPreamble(std::vector<Inclusion> Includes, PPCallbacks *Delegate,
-                 const SourceManager &SM, Preprocessor &PP,
-                 const LangOptions &LangOpts, const PreambleBounds &PB)
-      : Includes(std::move(Includes)), Delegate(Delegate), SM(SM), PP(PP) {
+  ReplayPreamble(std::vector<Inclusion> Includes, MainFileMacros Macros,
+                 PPCallbacks *Delegate, const SourceManager &SM,
+                 Preprocessor &PP, const LangOptions &LangOpts,
+                 const PreambleBounds &PB)
+      : Includes(std::move(Includes)), Macros(std::move(Macros)),
+        Delegate(Delegate), SM(SM), PP(PP) {
     // Only tokenize the preamble section of the main file, as we are not
     // interested in the rest of the tokens.
     MainFileTokens = syntax::tokenize(
@@ -194,6 +202,24 @@ private:
   }
 
   void replay() {
+    // Replay macro definitions from the preamble region of the main file,
+    // so that clang-tidy checks can observe them.
+    for (const auto &[SID, Refs] : Macros.MacroRefs) {
+      for (const auto &Ref : Refs) {
+        if (!Ref.IsDefinition)
+          continue;
+        auto Loc = SM.getComposedLoc(SM.getMainFileID(), Ref.StartOffset);
+        Token Tok;
+        if (Lexer::getRawToken(Loc, Tok, SM, PP.getLangOpts(), false))
+          continue;
+        if (auto *II = PP.getIdentifierInfo(Tok.getRawIdentifier())) {
+          Tok.setIdentifierInfo(II);
+          Tok.setKind(tok::identifier);
+          if (auto *MD = PP.getLocalMacroDirective(II))
+            Delegate->MacroDefined(Tok, MD);
+        }
+      }
+    }
     for (const auto &Inc : Includes) {
       OptionalFileEntryRef File;
       if (Inc.Resolved != "")
@@ -251,6 +277,7 @@ private:
   }
 
   const std::vector<Inclusion> Includes;
+  const MainFileMacros Macros;
   PPCallbacks *Delegate;
   const SourceManager &SM;
   Preprocessor &PP;
@@ -280,6 +307,8 @@ public:
     llvm::StringRef Check;
     while (!Checks.empty()) {
       std::tie(Check, Checks) = Checks.split(',');
+      Check = Check.trim();
+
       if (Check.empty())
         continue;
 
@@ -340,7 +369,7 @@ void applyWarningOptions(llvm::ArrayRef<std::string> ExtraArgs,
       if (Enable) {
         if (Diags.getDiagnosticLevel(ID, SourceLocation()) <
             DiagnosticsEngine::Warning) {
-          auto Group = DiagnosticIDs::getGroupForDiag(ID);
+          auto Group = Diags.getDiagnosticIDs()->getGroupForDiag(ID);
           if (!Group || !EnabledGroups(*Group))
             continue;
           Diags.setSeverity(ID, diag::Severity::Warning, SourceLocation());
@@ -373,13 +402,15 @@ std::vector<Diag> getIncludeCleanerDiags(ParsedAST &AST, llvm::StringRef Code,
       Cfg.Diagnostics.UnusedIncludes == Config::IncludesPolicy::None;
   if (SuppressMissing && SuppressUnused)
     return {};
-  auto Findings = computeIncludeCleanerFindings(AST);
+  auto Findings = computeIncludeCleanerFindings(
+      AST, Cfg.Diagnostics.Includes.AnalyzeAngledIncludes);
   if (SuppressMissing)
     Findings.MissingIncludes.clear();
   if (SuppressUnused)
     Findings.UnusedIncludes.clear();
-  return issueIncludeCleanerDiagnostics(AST, Code, Findings, TFS,
-                                        Cfg.Diagnostics.Includes.IgnoreHeader);
+  return issueIncludeCleanerDiagnostics(
+      AST, Code, Findings, TFS, Cfg.Diagnostics.Includes.IgnoreHeader,
+      Cfg.Style.AngledHeaders, Cfg.Style.QuotedHeaders);
 }
 
 tidy::ClangTidyCheckFactories
@@ -445,6 +476,12 @@ ParsedAST::build(llvm::StringRef Filename, const ParseInputs &Inputs,
           L->sawDiagnostic(D, Diag);
       });
 
+  // Adjust header search options to load the built module files recorded
+  // in RequiredModules.
+  if (Preamble && Preamble->RequiredModules)
+    Preamble->RequiredModules->adjustHeaderSearchOptions(
+        CI->getHeaderSearchOpts());
+
   std::optional<PreamblePatch> Patch;
   // We might use an ignoring diagnostic consumer if they are going to be
   // dropped later on to not pay for extra latency by processing them.
@@ -455,9 +492,10 @@ ParsedAST::build(llvm::StringRef Filename, const ParseInputs &Inputs,
     Patch->apply(*CI);
   }
   auto Clang = prepareCompilerInstance(
-      std::move(CI), PreamblePCH,
+      std::move(CI), Inputs.Opts.SkipPreambleBuild ? nullptr : PreamblePCH,
       llvm::MemoryBuffer::getMemBufferCopy(Inputs.Contents, Filename), VFS,
       *DiagConsumer);
+
   if (!Clang) {
     // The last diagnostic contains information about the reason of this
     // failure.
@@ -504,8 +542,8 @@ ParsedAST::build(llvm::StringRef Filename, const ParseInputs &Inputs,
   auto Action = std::make_unique<ClangdFrontendAction>();
   const FrontendInputFile &MainInput = Clang->getFrontendOpts().Inputs[0];
   if (!Action->BeginSourceFile(*Clang, MainInput)) {
-    log("BeginSourceFile() failed when building AST for {0}",
-        MainInput.getFile());
+    elog("BeginSourceFile() failed when building AST for {0}",
+         MainInput.getFile());
     return std::nullopt;
   }
   // If we saw an include guard in the preamble section of the main file,
@@ -542,14 +580,30 @@ ParsedAST::build(llvm::StringRef Filename, const ParseInputs &Inputs,
         E.instantiate()->addCheckFactories(*CTFactories);
       return CTFactories;
     }();
-    tidy::ClangTidyCheckFactories FastFactories = filterFastTidyChecks(
-        *AllCTFactories, Cfg.Diagnostics.ClangTidy.FastCheckFilter);
     CTContext.emplace(std::make_unique<tidy::DefaultOptionsProvider>(
-        tidy::ClangTidyGlobalOptions(), ClangTidyOpts));
-    CTContext->setDiagnosticsEngine(&Clang->getDiagnostics());
+                          tidy::ClangTidyGlobalOptions(), ClangTidyOpts),
+                      /*AllowEnablingAnalyzerAlphaCheckers=*/false,
+                      /*EnableModuleHeadersParsing=*/false,
+                      Cfg.Diagnostics.ClangTidy.ExperimentalCustomChecks);
+    // The lifetime of DiagnosticOptions is managed by \c Clang.
+    CTContext->setDiagnosticsEngine(nullptr, &Clang->getDiagnostics());
     CTContext->setASTContext(&Clang->getASTContext());
     CTContext->setCurrentFile(Filename);
     CTContext->setSelfContainedDiags(true);
+    tidy::ClangTidyCheckFactories CTCheckFactories = *AllCTFactories;
+#if CLANG_TIDY_ENABLE_QUERY_BASED_CUSTOM_CHECKS
+    if (CTContext->canExperimentalCustomChecks() &&
+        tidy::custom::RegisterCustomChecks) {
+      // RegisterCustomChecks tracks names in process-wide mutable state.
+      // Serializing its use keeps concurrent AST builds independent.
+      static std::mutex CustomChecksMu;
+      std::lock_guard<std::mutex> Lock(CustomChecksMu);
+      tidy::custom::RegisterCustomChecks(CTContext->getOptions(),
+                                         CTCheckFactories);
+    }
+#endif
+    tidy::ClangTidyCheckFactories FastFactories = filterFastTidyChecks(
+        CTCheckFactories, Cfg.Diagnostics.ClangTidy.FastCheckFilter);
     CTChecks = FastFactories.createChecksForLanguage(&*CTContext);
     Preprocessor *PP = &Clang->getPreprocessor();
     for (const auto &Check : CTChecks) {
@@ -574,11 +628,6 @@ ParsedAST::build(llvm::StringRef Filename, const ParseInputs &Inputs,
 
     ASTDiags.setLevelAdjuster([&](DiagnosticsEngine::Level DiagLevel,
                                   const clang::Diagnostic &Info) {
-      if (Cfg.Diagnostics.SuppressAll ||
-          isBuiltinDiagnosticSuppressed(Info.getID(), Cfg.Diagnostics.Suppress,
-                                        Clang->getLangOpts()))
-        return DiagnosticsEngine::Ignored;
-
       auto It = OverriddenSeverity.find(Info.getID());
       if (It != OverriddenSeverity.end())
         DiagLevel = It->second;
@@ -629,7 +678,8 @@ ParsedAST::build(llvm::StringRef Filename, const ParseInputs &Inputs,
           getFormatStyleForFile(Filename, Inputs.Contents, *Inputs.TFS, false);
       auto Inserter = std::make_shared<IncludeInserter>(
           Filename, Inputs.Contents, Style, BuildDir.get(),
-          &Clang->getPreprocessor().getHeaderSearchInfo());
+          &Clang->getPreprocessor().getHeaderSearchInfo(),
+          Cfg.Style.QuotedHeaders, Cfg.Style.AngledHeaders);
       ArrayRef<Inclusion> MainFileIncludes;
       if (Preamble) {
         MainFileIncludes = Preamble->Includes.MainFileIncludes;
@@ -660,8 +710,8 @@ ParsedAST::build(llvm::StringRef Filename, const ParseInputs &Inputs,
     Includes = Preamble->Includes;
     Includes.MainFileIncludes = Patch->preambleIncludes();
     // Replay the preamble includes so that clang-tidy checks can see them.
-    ReplayPreamble::attach(Patch->preambleIncludes(), *Clang,
-                           Patch->modifiedBounds());
+    ReplayPreamble::attach(Patch->preambleIncludes(), Patch->mainFileMacros(),
+                           *Clang, Patch->modifiedBounds());
     PI = *Preamble->Pragmas;
   }
   // Important: collectIncludeStructure is registered *after* ReplayPreamble!
@@ -680,7 +730,9 @@ ParsedAST::build(llvm::StringRef Filename, const ParseInputs &Inputs,
     Marks = Patch->marks();
   }
   auto &PP = Clang->getPreprocessor();
-  PP.addPPCallbacks(std::make_unique<CollectMainFileMacros>(PP, Macros));
+  auto MacroCollector = std::make_unique<CollectMainFileMacros>(PP, Macros);
+  auto *MacroCollectorPtr = MacroCollector.get(); // so we can call doneParse()
+  PP.addPPCallbacks(std::move(MacroCollector));
 
   PP.addPPCallbacks(
       collectPragmaMarksCallback(Clang->getSourceManager(), Marks));
@@ -700,6 +752,10 @@ ParsedAST::build(llvm::StringRef Filename, const ParseInputs &Inputs,
   if (llvm::Error Err = Action->Execute())
     log("Execute() failed when building AST for {0}: {1}", MainInput.getFile(),
         toString(std::move(Err)));
+
+  // Disable the macro collector for the remainder of this function, e.g.
+  // clang-tidy checkers.
+  MacroCollectorPtr->doneParse();
 
   // We have to consume the tokens before running clang-tidy to avoid collecting
   // tokens from running the preprocessor inside the checks (only

@@ -55,18 +55,17 @@ CodeGenVTables::EmitVTTDefinition(llvm::GlobalVariable *VTT,
   }
 
   SmallVector<llvm::Constant *, 8> VTTComponents;
-  for (const VTTComponent *i = Builder.getVTTComponents().begin(),
-                          *e = Builder.getVTTComponents().end(); i != e; ++i) {
-    const VTTVTable &VTTVT = Builder.getVTTVTables()[i->VTableIndex];
-    llvm::GlobalVariable *VTable = VTables[i->VTableIndex];
+  for (const auto &[Idx, C] : llvm::enumerate(Builder.getVTTComponents())) {
+    const VTTVTable &VTTVT = Builder.getVTTVTables()[C.VTableIndex];
+    llvm::GlobalVariable *VTable = VTables[C.VTableIndex];
     VTableLayout::AddressPointLocation AddressPoint;
     if (VTTVT.getBase() == RD) {
       // Just get the address point for the regular vtable.
       AddressPoint =
           getItaniumVTableContext().getVTableLayout(RD).getAddressPoint(
-              i->VTableBase);
+              C.VTableBase);
     } else {
-      AddressPoint = VTableAddressPoints[i->VTableIndex].lookup(i->VTableBase);
+      AddressPoint = VTableAddressPoints[C.VTableIndex].lookup(C.VTableBase);
       assert(AddressPoint.AddressPointIndex != 0 &&
              "Did not find ctor vtable address point!");
     }
@@ -85,11 +84,24 @@ CodeGenVTables::EmitVTTDefinition(llvm::GlobalVariable *VTT,
          cast<llvm::StructType>(VTable->getValueType())
              ->getElementType(AddressPoint.VTableIndex));
      unsigned Offset = ComponentSize * AddressPoint.AddressPointIndex;
-     llvm::ConstantRange InRange(llvm::APInt(32, -Offset, true),
-                                 llvm::APInt(32, VTableSize - Offset, true));
+     llvm::ConstantRange InRange(
+         llvm::APInt(32, (int)-Offset, true),
+         llvm::APInt(32, (int)(VTableSize - Offset), true));
      llvm::Constant *Init = llvm::ConstantExpr::getGetElementPtr(
          VTable->getValueType(), VTable, Idxs, /*InBounds=*/true, InRange);
 
+     if (auto PAuthQual =
+             CGM.getVTablePointerAuthentication(VTTVT.getBase(),
+                                                /*IsVTTEntry=*/true)) {
+       llvm::Constant *Address = nullptr;
+       if (PAuthQual->isAddressDiscriminated())
+         Address = llvm::ConstantExpr::getGetElementPtr(
+             VTT->getType(), VTT, llvm::ConstantInt::get(CGM.Int32Ty, Idx));
+       auto *Discriminator = llvm::ConstantInt::get(
+           CGM.IntPtrTy, PAuthQual->getExtraDiscriminator());
+       Init = CGM.getConstantSignedPointer(Init, PAuthQual->getKey(), Address,
+                                           Discriminator);
+     }
      VTTComponents.push_back(Init);
   }
 

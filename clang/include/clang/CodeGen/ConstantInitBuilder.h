@@ -22,11 +22,15 @@
 #include "clang/AST/CharUnits.h"
 #include "clang/CodeGen/ConstantInitFuture.h"
 
+#include <optional>
 #include <vector>
 
 namespace clang {
-namespace CodeGen {
+class GlobalDecl;
+class PointerAuthSchema;
+class QualType;
 
+namespace CodeGen {
 class CodeGenModule;
 
 /// A convenience builder class for complex constant initializers,
@@ -74,13 +78,12 @@ protected:
   }
 
 private:
-  llvm::GlobalVariable *createGlobal(llvm::Constant *initializer,
-                                     const llvm::Twine &name,
-                                     CharUnits alignment,
-                                     bool constant = false,
-                                     llvm::GlobalValue::LinkageTypes linkage
-                                       = llvm::GlobalValue::InternalLinkage,
-                                     unsigned addressSpace = 0);
+  llvm::GlobalVariable *
+  createGlobal(llvm::Constant *initializer, const llvm::Twine &name,
+               CharUnits alignment, bool constant = false,
+               llvm::GlobalValue::LinkageTypes linkage =
+                   llvm::GlobalValue::InternalLinkage,
+               std::optional<unsigned> addressSpace = std::nullopt);
 
   ConstantInitFuture createFuture(llvm::Constant *initializer);
 
@@ -198,6 +201,11 @@ public:
               bool isSigned = false) {
     add(llvm::ConstantInt::get(intTy, value, isSigned));
   }
+
+  /// Add a signed pointer using the given pointer authentication schema.
+  void addSignedPointer(llvm::Constant *Pointer,
+                        const PointerAuthSchema &Schema, GlobalDecl CalleeDecl,
+                        QualType CalleeType);
 
   /// Add a null pointer of a specific type.
   void addNullPointer(llvm::PointerType *ptrTy) {

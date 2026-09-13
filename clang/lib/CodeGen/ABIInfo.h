@@ -20,11 +20,13 @@ class Value;
 class LLVMContext;
 class DataLayout;
 class Type;
+class FixedVectorType;
 } // namespace llvm
 
 namespace clang {
 class ASTContext;
 class CodeGenOptions;
+class FunctionDecl;
 class TargetInfo;
 
 namespace CodeGen {
@@ -34,6 +36,8 @@ class CGCXXABI;
 class CGFunctionInfo;
 class CodeGenFunction;
 class CodeGenTypes;
+class RValue;
+class AggValueSlot;
 
 // FIXME: All of this stuff should be part of the target interface
 // somehow. It is currently here because it is not clear how to factor
@@ -66,6 +70,14 @@ public:
   /// functions.
   llvm::CallingConv::ID getRuntimeCC() const { return RuntimeCC; }
 
+  // Get X86ABIAVXLevel for the given FunctionDecl and ExtInfo.
+  // This can be different than the global / module level X86ABIAVXLevel
+  // due to function attributes.
+  virtual unsigned getX86ABIAVXLevel(const FunctionDecl *,
+                                     const FunctionType::ExtInfo &) const {
+    return 0;
+  }
+
   virtual void computeInfo(CodeGen::CGFunctionInfo &FI) const = 0;
 
   /// EmitVAArg - Emit the target dependent code to load a value of
@@ -75,18 +87,24 @@ public:
   // the ABI information any lower than CodeGen. Of course, for
   // VAArg handling it has to be at this level; there is no way to
   // abstract this out.
-  virtual CodeGen::Address EmitVAArg(CodeGen::CodeGenFunction &CGF,
-                                     CodeGen::Address VAListAddr,
-                                     QualType Ty) const = 0;
+  virtual RValue EmitVAArg(CodeGen::CodeGenFunction &CGF,
+                           CodeGen::Address VAListAddr, QualType Ty,
+                           AggValueSlot Slot) const = 0;
 
   bool isAndroid() const;
   bool isOHOSFamily() const;
 
   /// Emit the target dependent code to load a value of
   /// \arg Ty from the \c __builtin_ms_va_list pointed to by \arg VAListAddr.
-  virtual CodeGen::Address EmitMSVAArg(CodeGen::CodeGenFunction &CGF,
-                                       CodeGen::Address VAListAddr,
-                                       QualType Ty) const;
+  virtual RValue EmitMSVAArg(CodeGen::CodeGenFunction &CGF,
+                             CodeGen::Address VAListAddr, QualType Ty,
+                             AggValueSlot Slot) const;
+
+  /// Emit the target dependent code to load a value of
+  /// \arg Ty from the \c __builtin_zos_va_list pointed to by \arg VAListAddr.
+  virtual RValue EmitZOSVAArg(CodeGen::CodeGenFunction &CGF,
+                              CodeGen::Address VAListAddr, QualType Ty,
+                              AggValueSlot Slot) const;
 
   virtual bool isHomogeneousAggregateBaseType(QualType Ty) const;
 
@@ -107,7 +125,8 @@ public:
   /// A convenience method to return an indirect ABIArgInfo with an
   /// expected alignment equal to the ABI alignment of the given type.
   CodeGen::ABIArgInfo
-  getNaturalAlignIndirect(QualType Ty, bool ByVal = true, bool Realign = false,
+  getNaturalAlignIndirect(QualType Ty, unsigned AddrSpace, bool ByVal = true,
+                          bool Realign = false,
                           llvm::Type *Padding = nullptr) const;
 
   CodeGen::ABIArgInfo getNaturalAlignIndirectInReg(QualType Ty,
@@ -121,6 +140,24 @@ public:
                                        raw_ostream &Out) const;
   virtual void appendAttributeMangling(StringRef AttrStr,
                                        raw_ostream &Out) const;
+
+  /// Returns the optimal vector memory type based on the given vector type. For
+  /// example, on certain targets, a vector with 3 elements might be promoted to
+  /// one with 4 elements to improve performance.
+  virtual llvm::FixedVectorType *
+  getOptimalVectorMemoryType(llvm::FixedVectorType *T,
+                             const LangOptions &Opt) const;
+
+  virtual llvm::Value *createCoercedLoad(Address SrcAddr, const ABIArgInfo &AI,
+                                         CodeGenFunction &CGF) const;
+  virtual void createCoercedStore(llvm::Value *Val, Address DstAddr,
+                                  const ABIArgInfo &AI, bool DestIsVolatile,
+                                  CodeGenFunction &CGF) const;
+
+  /// Used by Arm64EC calling convention code to call into x86 calling
+  /// convention code for varargs function.
+  virtual ABIArgInfo classifyArgForArm64ECVarArg(QualType Ty,
+                                                 bool IsNamedArg) const;
 };
 
 /// Target specific hooks for defining how a type should be passed or returned

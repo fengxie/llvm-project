@@ -18,6 +18,7 @@
 #include "llvm/ADT/IndexedMap.h"
 #include "llvm/BinaryFormat/GOFF.h"
 #include "llvm/Object/ObjectFile.h"
+#include "llvm/Support/Compiler.h"
 #include "llvm/Support/ConvertEBCDIC.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
@@ -28,7 +29,7 @@ namespace llvm {
 
 namespace object {
 
-class GOFFObjectFile : public ObjectFile {
+class LLVM_ABI GOFFObjectFile : public ObjectFile {
   friend class GOFFSymbolRef;
 
   IndexedMap<const uint8_t *> EsdPtrs; // Indexed by EsdId.
@@ -43,8 +44,34 @@ class GOFFObjectFile : public ObjectFile {
   SmallVector<SectionEntryImpl, 256> SectionList;
   mutable DenseMap<uint32_t, SmallVector<uint8_t>> SectionDataCache;
 
+  // Flattened data for all logical records (record type + continuous data
+  // without headers).
+  SmallVector<std::pair<GOFF::RecordType, SmallVector<uint8_t>>> FlattenedData;
+
+  // Populate FlattenedData with all logical records.
+  Error createFlattenedData();
+
+  // Helper to get continuous data from a logical record (includes prefix +
+  // continuations) Returns the number of physical records consumed (including
+  // the initial record)
+  Expected<unsigned> getContinuousData(SmallVectorImpl<uint8_t> &CompleteData,
+                                       int DataIndex, uint16_t DataLength,
+                                       const uint8_t *Record) const;
+
 public:
+  // Get the flattened data structure
+  const SmallVector<std::pair<GOFF::RecordType, SmallVector<uint8_t>>> &
+  getFlattenedData() const {
+    return FlattenedData;
+  }
+
   Expected<StringRef> getSymbolName(SymbolRef Symbol) const;
+
+  // Returns the z/OS archive symbol attribute bits for a symbol:
+  //   bit 2 (0x4): symbol is 64-bit
+  //   bit 1 (0x2): symbol uses the XPLink calling convention
+  //   bit 0 (0x1): symbol resides in a writable static area (WSA)
+  uint32_t getZOSSymbolArchiveAttributes(DataRefImpl Symb) const;
 
   GOFFObjectFile(MemoryBufferRef Object, Error &Err);
   static inline bool classof(const Binary *V) { return V->isGOFF(); }
@@ -90,10 +117,10 @@ private:
 
   // SectionRef.
   void moveSectionNext(DataRefImpl &Sec) const override;
-  virtual Expected<StringRef> getSectionName(DataRefImpl Sec) const override;
+  Expected<StringRef> getSectionName(DataRefImpl Sec) const override;
   uint64_t getSectionAddress(DataRefImpl Sec) const override;
   uint64_t getSectionSize(DataRefImpl Sec) const override;
-  virtual Expected<ArrayRef<uint8_t>>
+  Expected<ArrayRef<uint8_t>>
   getSectionContents(DataRefImpl Sec) const override;
   uint64_t getSectionIndex(DataRefImpl Sec) const override { return Sec.d.a; }
   uint64_t getSectionAlignment(DataRefImpl Sec) const override;

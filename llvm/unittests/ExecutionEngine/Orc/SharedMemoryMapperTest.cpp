@@ -7,9 +7,12 @@
 //===----------------------------------------------------------------------===//
 
 #include "OrcTestCommon.h"
-
+#include "llvm/Config/llvm-config.h" // for LLVM_ON_UNIX
+#include "llvm/ExecutionEngine/JITLink/JITLink.h"
 #include "llvm/ExecutionEngine/Orc/MemoryMapper.h"
+#include "llvm/ExecutionEngine/Orc/SelfExecutorProcessControl.h"
 #include "llvm/ExecutionEngine/Orc/Shared/OrcRTBridge.h"
+#include "llvm/ExecutionEngine/Orc/Shared/SPSCI/SharedMemoryMapperSPSCI.h"
 #include "llvm/ExecutionEngine/Orc/TargetProcess/ExecutorSharedMemoryMapperService.h"
 #include "llvm/Testing/Support/Error.h"
 
@@ -21,8 +24,7 @@ using namespace llvm::orc::rt_bootstrap;
 #if (defined(LLVM_ON_UNIX) && !defined(__ANDROID__)) || defined(_WIN32)
 
 // A basic function to be used as both initializer/deinitializer
-orc::shared::CWrapperFunctionResult incrementWrapper(const char *ArgData,
-                                                     size_t ArgSize) {
+CWrapperFunctionBuffer incrementWrapper(const char *ArgData, size_t ArgSize) {
   return WrapperFunction<SPSError(SPSExecutorAddr)>::handle(
              ArgData, ArgSize,
              [](ExecutorAddr A) -> Error {
@@ -46,13 +48,11 @@ TEST(SharedMemoryMapperTest, MemReserveInitializeDeinitializeRelease) {
   {
     StringMap<ExecutorAddr> Map;
     MapperService.addBootstrapSymbols(Map);
-    SAs.Instance = Map[rt::ExecutorSharedMemoryMapperServiceInstanceName];
-    SAs.Reserve = Map[rt::ExecutorSharedMemoryMapperServiceReserveWrapperName];
-    SAs.Initialize =
-        Map[rt::ExecutorSharedMemoryMapperServiceInitializeWrapperName];
-    SAs.Deinitialize =
-        Map[rt::ExecutorSharedMemoryMapperServiceDeinitializeWrapperName];
-    SAs.Release = Map[rt::ExecutorSharedMemoryMapperServiceReleaseWrapperName];
+    SAs.Instance = Map[rt::sps_ci::SharedMemoryMapperInstanceName];
+    SAs.Reserve = Map[rt::sps_ci::SharedMemoryMapperReserve::Name];
+    SAs.Initialize = Map[rt::sps_ci::SharedMemoryMapperInitialize::Name];
+    SAs.Deinitialize = Map[rt::sps_ci::SharedMemoryMapperDeinitialize::Name];
+    SAs.Release = Map[rt::sps_ci::SharedMemoryMapperRelease::Name];
   }
 
   std::string TestString = "Hello, World!";
@@ -67,12 +67,16 @@ TEST(SharedMemoryMapperTest, MemReserveInitializeDeinitializeRelease) {
 
     auto PageSize = Mapper->getPageSize();
     size_t ReqSize = PageSize;
+    jitlink::LinkGraph G("G", std::make_shared<SymbolStringPool>(),
+                         Triple("x86_64-apple-darwin"), SubtargetFeatures(),
+                         jitlink::getGenericEdgeKindName);
 
     Mapper->reserve(ReqSize, [&](Expected<ExecutorAddrRange> Result) {
       EXPECT_THAT_ERROR(Result.takeError(), Succeeded());
       auto Reservation = std::move(*Result);
       {
-        char *Addr = Mapper->prepare(Reservation.Start, TestString.size() + 1);
+        char *Addr =
+            Mapper->prepare(G, Reservation.Start, TestString.size() + 1);
         std::strcpy(Addr, TestString.c_str());
       }
       MemoryMapper::AllocInfo AI;

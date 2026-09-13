@@ -20,11 +20,12 @@
 #include "XtensaGenRegisterInfo.inc"
 
 namespace llvm {
-class TargetRegisterClass;
+class MCRegisterClass;
+using TargetRegisterClass = MCRegisterClass;
 class XtensaInstrInfo;
 class XtensaSubtarget;
 
-struct XtensaRegisterInfo : public XtensaGenRegisterInfo {
+class XtensaRegisterInfo : public XtensaGenRegisterInfo {
 public:
   const XtensaSubtarget &Subtarget;
 
@@ -35,6 +36,10 @@ public:
   }
 
   bool requiresFrameIndexScavenging(const MachineFunction &MF) const override {
+    return true;
+  }
+
+  bool trackLivenessAfterRegAlloc(const MachineFunction &) const override {
     return true;
   }
 

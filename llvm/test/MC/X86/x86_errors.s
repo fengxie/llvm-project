@@ -170,6 +170,14 @@ cmpxchg16b (%eax)
 
 // X86: error: unsupported instruction
 // X64: error: unsupported instruction
+{rex} vmovdqu32 %xmm0, %xmm0
+
+// X86: error: unsupported instruction
+// X64: error: unsupported instruction
+{rex2} vmovdqu32 %xmm0, %xmm0
+
+// X86: error: unsupported instruction
+// X64: error: unsupported instruction
 {vex} vmovdqu32 %xmm0, %xmm0
 
 // X86: error: unsupported instruction
@@ -193,3 +201,16 @@ pbndkb
 
 // X86: error: register %r16d is only available in 64-bit mode
 movl %eax, %r16d
+
+// X86: error: unexpected register in memory operand
+// X64: error: unexpected register in memory operand
+movl $0, %cs:%ds:(%eax)
+
+// X86: error: unexpected register in memory operand
+// X64: error: unexpected register in memory operand
+movl $0, %cs:%eax
+
+.set reg, %eax
+// X86: error: unexpected register in memory operand
+// X64: error: unexpected register in memory operand
+movl $0, ((reg))

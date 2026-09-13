@@ -1,4 +1,4 @@
-"""Test the SBCommandInterpreter APIs."""
+"""tESt the SBCommandInterpreter APIs."""
 
 import json
 import lldb
@@ -104,9 +104,10 @@ class CommandInterpreterAPICase(TestBase):
 
         return json.loads(stream.GetData())
 
-    def test_structured_transcript(self):
+    def test_get_transcript(self):
         """Test structured transcript generation and retrieval."""
         ci = self.buildAndCreateTarget()
+        self.assertTrue(ci, VALID_COMMAND_INTERPRETER)
 
         # Make sure the "save-transcript" setting is on
         self.runCmd("settings set interpreter.save-transcript true")
@@ -118,8 +119,7 @@ class CommandInterpreterAPICase(TestBase):
         res = lldb.SBCommandReturnObject()
         ci.HandleCommand("version", res)
         ci.HandleCommand("an-unknown-command", res)
-        ci.HandleCommand("breakpoint set -f main.c -l %d" % self.line, res)
-        ci.HandleCommand("r", res)
+        ci.HandleCommand("br s -f main.c -l %d" % self.line, res)
         ci.HandleCommand("p a", res)
         ci.HandleCommand("statistics dump", res)
         total_number_of_commands = 6
@@ -130,56 +130,71 @@ class CommandInterpreterAPICase(TestBase):
         # All commands should have expected fields.
         for command in transcript:
             self.assertIn("command", command)
+            # Unresolved commands don't have "commandName"/"commandArguments".
+            # We will validate these fields below, instead of here.
             self.assertIn("output", command)
             self.assertIn("error", command)
-            self.assertIn("seconds", command)
+            self.assertIn("durationInSeconds", command)
+            self.assertIn("timestampInEpochSeconds", command)
 
         # The following validates individual commands in the transcript.
         #
         # Notes:
         # 1. Some of the asserts rely on the exact output format of the
         #    commands. Hopefully we are not changing them any time soon.
-        # 2. We are removing the "seconds" field from each command, so that
-        #    some of the validations below can be easier / more readable.
+        # 2. We are removing the time-related fields from each command, so
+        #    that some of the validations below can be easier / more readable.
         for command in transcript:
-            del(command["seconds"])
+            del command["durationInSeconds"]
+            del command["timestampInEpochSeconds"]
 
         # (lldb) version
         self.assertEqual(transcript[0]["command"], "version")
+        self.assertEqual(transcript[0]["commandName"], "version")
+        self.assertEqual(transcript[0]["commandArguments"], "")
         self.assertIn("lldb version", transcript[0]["output"])
         self.assertEqual(transcript[0]["error"], "")
 
         # (lldb) an-unknown-command
-        self.assertEqual(transcript[1],
+        self.assertEqual(
+            transcript[1],
             {
                 "command": "an-unknown-command",
+                # Unresolved commands don't have "commandName"/"commandArguments"
                 "output": "",
-                "error": "error: 'an-unknown-command' is not a valid command.\n",
-            })
+                "error": "error: 'an-unknown-command' is not a valid command\n",
+            },
+        )
 
-        # (lldb) breakpoint set -f main.c -l <line>
-        self.assertEqual(transcript[2]["command"], "breakpoint set -f main.c -l %d" % self.line)
+        # (lldb) br s -f main.c -l <line>
+        self.assertEqual(transcript[2]["command"], "br s -f main.c -l %d" % self.line)
+        self.assertEqual(transcript[2]["commandName"], "breakpoint set")
+        self.assertEqual(
+            transcript[2]["commandArguments"], "-f main.c -l %d" % self.line
+        )
         # Breakpoint 1: where = a.out`main + 29 at main.c:5:3, address = 0x0000000100000f7d
         self.assertIn("Breakpoint 1: where = a.out`main ", transcript[2]["output"])
         self.assertEqual(transcript[2]["error"], "")
 
-        # (lldb) r
-        self.assertEqual(transcript[3]["command"], "r")
-        # Process 25494 launched: '<path>/TestCommandInterpreterAPI.test_structured_transcript/a.out' (x86_64)
-        self.assertIn("Process", transcript[3]["output"])
-        self.assertIn("launched", transcript[3]["output"])
-        self.assertEqual(transcript[3]["error"], "")
-
         # (lldb) p a
-        self.assertEqual(transcript[4],
+        self.assertEqual(
+            transcript[3],
             {
                 "command": "p a",
-                "output": "(int) 123\n",
-                "error": "",
-            })
+                "commandName": "dwim-print",
+                "commandArguments": "-- a",
+                "output": "",
+                "error": "note: Falling back to default language. Ran expression as 'Objective C++'.\n"
+                "error: <user expression 0>:1:1: use of undeclared identifier 'a'\n    1 | a\n      | ^\n",
+            },
+        )
 
         # (lldb) statistics dump
-        statistics_dump = json.loads(transcript[5]["output"])
+        self.assertEqual(transcript[4]["command"], "statistics dump")
+        self.assertEqual(transcript[4]["commandName"], "statistics dump")
+        self.assertEqual(transcript[4]["commandArguments"], "")
+        self.assertEqual(transcript[4]["error"], "")
+        statistics_dump = json.loads(transcript[4]["output"])
         # Dump result should be valid JSON
         self.assertTrue(statistics_dump is not json.JSONDecodeError)
         # Dump result should contain expected fields
@@ -189,15 +204,18 @@ class CommandInterpreterAPICase(TestBase):
         self.assertIn("targets", statistics_dump)
 
     def test_save_transcript_setting_default(self):
-        ci = self.buildAndCreateTarget()
-        res = lldb.SBCommandReturnObject()
+        ci = self.dbg.GetCommandInterpreter()
+        self.assertTrue(ci, VALID_COMMAND_INTERPRETER)
 
         # The setting's default value should be "false"
-        self.runCmd("settings show interpreter.save-transcript", "interpreter.save-transcript (boolean) = false\n")
-        # self.assertEqual(res.GetOutput(), )
+        self.runCmd(
+            "settings show interpreter.save-transcript",
+            "interpreter.save-transcript (boolean) = false\n",
+        )
 
     def test_save_transcript_setting_off(self):
-        ci = self.buildAndCreateTarget()
+        ci = self.dbg.GetCommandInterpreter()
+        self.assertTrue(ci, VALID_COMMAND_INTERPRETER)
 
         # Make sure the setting is off
         self.runCmd("settings set interpreter.save-transcript false")
@@ -208,8 +226,8 @@ class CommandInterpreterAPICase(TestBase):
         self.assertEqual(transcript, [])
 
     def test_save_transcript_setting_on(self):
-        ci = self.buildAndCreateTarget()
-        res = lldb.SBCommandReturnObject()
+        ci = self.dbg.GetCommandInterpreter()
+        self.assertTrue(ci, VALID_COMMAND_INTERPRETER)
 
         # Make sure the setting is on
         self.runCmd("settings set interpreter.save-transcript true")
@@ -220,7 +238,7 @@ class CommandInterpreterAPICase(TestBase):
         self.assertEqual(len(transcript), 1)
         self.assertEqual(transcript[0]["command"], "version")
 
-    def test_save_transcript_returns_copy(self):
+    def test_get_transcript_returns_copy(self):
         """
         Test that the returned structured data is *at least* a shallow copy.
 
@@ -229,7 +247,8 @@ class CommandInterpreterAPICase(TestBase):
         because there is no logic in the command interpreter to modify a
         transcript item (representing a command) after it has been returned.
         """
-        ci = self.buildAndCreateTarget()
+        ci = self.dbg.GetCommandInterpreter()
+        self.assertTrue(ci, VALID_COMMAND_INTERPRETER)
 
         # Make sure the setting is on
         self.runCmd("settings set interpreter.save-transcript true")
@@ -239,17 +258,73 @@ class CommandInterpreterAPICase(TestBase):
         structured_data_1 = ci.GetTranscript()
         self.assertTrue(structured_data_1.IsValid())
         self.assertEqual(structured_data_1.GetSize(), 1)
-        self.assertEqual(structured_data_1.GetItemAtIndex(0).GetValueForKey("command").GetStringValue(100), "version")
+        self.assertEqual(
+            structured_data_1.GetItemAtIndex(0)
+            .GetValueForKey("command")
+            .GetStringValue(100),
+            "version",
+        )
 
         # Run some more commands and get the transcript as structured data again
         self.runCmd("help")
         structured_data_2 = ci.GetTranscript()
         self.assertTrue(structured_data_2.IsValid())
         self.assertEqual(structured_data_2.GetSize(), 2)
-        self.assertEqual(structured_data_2.GetItemAtIndex(0).GetValueForKey("command").GetStringValue(100), "version")
-        self.assertEqual(structured_data_2.GetItemAtIndex(1).GetValueForKey("command").GetStringValue(100), "help")
+        self.assertEqual(
+            structured_data_2.GetItemAtIndex(0)
+            .GetValueForKey("command")
+            .GetStringValue(100),
+            "version",
+        )
+        self.assertEqual(
+            structured_data_2.GetItemAtIndex(1)
+            .GetValueForKey("command")
+            .GetStringValue(100),
+            "help",
+        )
 
         # Now, the first structured data should remain unchanged
         self.assertTrue(structured_data_1.IsValid())
         self.assertEqual(structured_data_1.GetSize(), 1)
-        self.assertEqual(structured_data_1.GetItemAtIndex(0).GetValueForKey("command").GetStringValue(100), "version")
+        self.assertEqual(
+            structured_data_1.GetItemAtIndex(0)
+            .GetValueForKey("command")
+            .GetStringValue(100),
+            "version",
+        )
+
+    def test_handle_command_with_execution_context_override(self):
+        """Test that HandleCommand with an override context works correctly and does not bypass non-dummy targets."""
+        self.build()
+        target, process, thread, _ = lldbutil.run_to_line_breakpoint(
+            self, lldb.SBFileSpec("main.c"), self.line
+        )
+        frame = thread.GetSelectedFrame()
+        self.assertTrue(frame.IsValid())
+        exe_ctx = lldb.SBExecutionContext(frame)
+
+        # With an dummy override target, the command should fail -- it should not use valid target selected in the debugger.
+        exe_ctx = lldb.SBExecutionContext(self.dbg.GetDummyTarget())
+        res = lldb.SBCommandReturnObject()
+        self.ci.HandleCommand("frame variable", exe_ctx, res)
+        self.assertFalse(res.Succeeded())
+        self.assertIn("invalid target", res.GetError())
+
+        # The same goes for a target which is not running.
+        exe = self.getBuildArtifact("a.out")
+        target2 = self.dbg.CreateTarget(exe)
+        self.assertTrue(target2.IsValid())
+        exe_ctx = lldb.SBExecutionContext(self.dbg.GetDummyTarget())
+        res = lldb.SBCommandReturnObject()
+        self.ci.HandleCommand("frame variable", exe_ctx, res)
+        self.assertFalse(res.Succeeded())
+        self.assertIn("invalid target", res.GetError())
+
+        # Now try vice-versa. The command should successfully use the target from the override context.
+        self.dbg.SetSelectedTarget(target)
+        exe_ctx = lldb.SBExecutionContext(frame)
+        res = lldb.SBCommandReturnObject()
+        self.ci.HandleCommand("frame variable", exe_ctx, res)
+        self.assertTrue(
+            res.Succeeded(), "HandleCommand with override context succeeded"
+        )

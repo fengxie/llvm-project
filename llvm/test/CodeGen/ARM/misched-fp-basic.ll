@@ -5,6 +5,8 @@
 ; RUN:   /dev/null | FileCheck %s --check-prefix=CHECK --check-prefix=CHECK_SWIFT
 ; RUN: llc < %s -mtriple=arm-eabi -mcpu=cortex-r52 -enable-misched -verify-misched -debug-only=machine-scheduler -o - 2>&1 > \
 ; RUN:   /dev/null | FileCheck %s --check-prefix=CHECK --check-prefix=CHECK_R52
+; RUN: llc < %s -mtriple=arm-eabi -mcpu=cortex-r52plus -enable-misched -verify-misched -debug-only=machine-scheduler -o - 2>&1 > \
+; RUN:   /dev/null | FileCheck %s --check-prefix=CHECK --check-prefix=CHECK_R52
 ;
 ; Check the latency of instructions for processors with sched-models
 ;
@@ -12,7 +14,7 @@
 define i32 @foo(float %a, float %b, float %c, i32 %d) local_unnamed_addr #0 {
 entry:
 ;
-; CHECK:       ********** MI Scheduling **********
+; CHECK:       Current Schedule Region
 ; CHECK_A9:    VADDS
 ; CHECK_SWIFT: VADDfd
 ; CHECK_R52:   VADDS

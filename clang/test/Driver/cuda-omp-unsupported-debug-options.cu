@@ -1,5 +1,3 @@
-// REQUIRES: x86-registered-target
-// REQUIRES: nvptx-registered-target
 // REQUIRES: zlib
 
 // RUN: %clang -### --target=x86_64-linux-gnu --offload-arch=sm_52 -nogpulib -nogpuinc -c %s -g -gz 2>&1 \
@@ -59,6 +57,6 @@
 // WARN-GES-SAME: requires DWARF-5 but target 'nvptx64-nvidia-cuda' only provides DWARF-2 [-Wunsupported-target-opt]
 // COMMON-NOT: debug information option '{{.*}}' is not supported for target 'x86
 // COMMON: "-triple" "nvptx64-nvidia-cuda"
-// COMMON-NOT: {{-compress-debug|-fdebug-info-for-profiling|lldb|codeview|module-format|embed-source|debug-info-macro|gnu-pubnames|generate-arange-section|generate-type-units}}
+// COMMON-NOT: {{-compress-debug-sections=|-fdebug-info-for-profiling|-debugger-tuning=lldb|-gcodeview|-fmodule-format=|-gembed-source|-debug-info-macro|-ggnu-pubnames|-generate-arange-section|-generate-type-units}}
 // COMMON: "-triple" "x86_64
-// COMMON-SAME: {{-compress-debug|-fdebug-info-for-profiling|split-dwarf|lldb|codeview|module-format|embed-source|debug-info-macro|gnu-pubnames|generate-arange-section|generate-type-units}}
+// COMMON-SAME: {{-compress-debug-sections=|-fdebug-info-for-profiling|-split-dwarf-|-debugger-tuning=lldb|-gcodeview|-fmodule-format=|-gembed-source|-debug-info-macro|-ggnu-pubnames|-generate-arange-section|-generate-type-units}}

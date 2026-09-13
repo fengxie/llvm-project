@@ -1,3 +1,4 @@
+//===----------------------------------------------------------------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -7,9 +8,11 @@
 
 // UNSUPPORTED: c++03, c++11, c++14, c++17
 // UNSUPPORTED: no-threads
-// XFAIL: availability-synchronization_library-missing
 // XFAIL: !has-64-bit-atomics
 // XFAIL: !has-1024-bit-atomics
+
+// MSVC warning C4310: cast truncates constant value
+// ADDITIONAL_COMPILE_FLAGS(cl-style-warnings): /wd4310
 
 // void wait(T, memory_order = memory_order::seq_cst) const noexcept;
 
@@ -26,7 +29,7 @@ template <typename T>
 struct TestWait {
   void operator()() const {
     {
-      T x(T(1));
+      alignas(std::atomic_ref<T>::required_alignment) T x(T(1));
       std::atomic_ref<T> const a(x);
 
       assert(a.load() == T(1));

@@ -57,18 +57,26 @@ define i32 @ashr_exact_keep(i32 %a, i32 %b) {
   ret i32 %op
 }
 
-; CHECK-LABEL: @getelementptr_inbounds_drop(
+; CHECK-LABEL: @getelementptr_inbounds_nuw_drop_both(
 ; INTERESTING: getelementptr
 ; RESULT: getelementptr i32, ptr %a, i64 %b
-define ptr @getelementptr_inbounds_drop(ptr %a, i64 %b) {
-  %op = getelementptr inbounds i32, ptr %a, i64 %b
+define ptr @getelementptr_inbounds_nuw_drop_both(ptr %a, i64 %b) {
+  %op = getelementptr inbounds nuw i32, ptr %a, i64 %b
   ret ptr %op
 }
 
-; CHECK-LABEL: @getelementptr_inbounds_keep(
+; CHECK-LABEL: @getelementptr_inbounds_keep_only_inbounds(
 ; INTERESTING: inbounds
 ; RESULT: getelementptr inbounds i32, ptr %a, i64 %b
-define ptr @getelementptr_inbounds_keep(ptr %a, i64 %b) {
+define ptr @getelementptr_inbounds_keep_only_inbounds(ptr %a, i64 %b) {
+  %op = getelementptr inbounds nuw i32, ptr %a, i64 %b
+  ret ptr %op
+}
+
+; CHECK-LABEL: @getelementptr_inbounds_relax_to_nusw(
+; INTERESTING: getelementptr {{inbounds|nusw}}
+; RESULT: getelementptr nusw i32, ptr %a, i64 %b
+define ptr @getelementptr_inbounds_relax_to_nusw(ptr %a, i64 %b) {
   %op = getelementptr inbounds i32, ptr %a, i64 %b
   ret ptr %op
 }
@@ -263,4 +271,44 @@ define i32 @trunc_nsw_drop(i64 %a) {
 define i32 @trunc_nsw_keep(i64 %a) {
   %op = trunc nsw i64 %a to i32
   ret i32 %op
+}
+
+; CHECK-LABEL: @icmp_samesign_drop(
+; INTERESTING: = icmp
+; RESULT: icmp ult i32
+define i1 @icmp_samesign_drop(i32 %a) {
+  %op = icmp samesign ult i32 %a, 10
+  ret i1 %op
+}
+
+; CHECK-LABEL: @icmp_samesign_keep(
+; INTERESTING: = icmp samesign
+; RESULT: icmp samesign ult i32
+define i1 @icmp_samesign_keep(i32 %a) {
+  %op = icmp samesign ult i32 %a, 10
+  ret i1 %op
+}
+
+; CHECK-LABEL: @addrspacecast_nonnull_drop(
+; INTERESTING: = addrspacecast
+; RESULT: addrspacecast ptr addrspace(1) %a to ptr
+define ptr @addrspacecast_nonnull_drop(ptr addrspace(1) %a) {
+  %op = addrspacecast nonnull ptr addrspace(1) %a to ptr
+  ret ptr %op
+}
+
+; CHECK-LABEL: @addrspacecast_nonnull_keep(
+; INTERESTING: = addrspacecast nonnull
+; RESULT: addrspacecast nonnull ptr addrspace(1) %a to ptr
+define ptr @addrspacecast_nonnull_keep(ptr addrspace(1) %a) {
+  %op = addrspacecast nonnull ptr addrspace(1) %a to ptr
+  ret ptr %op
+}
+
+; CHECK-LABEL: @addrspacecast_nonnull_vector_keep(
+; INTERESTING: = addrspacecast nonnull
+; RESULT: addrspacecast nonnull <2 x ptr addrspace(1)> %a to <2 x ptr>
+define <2 x ptr> @addrspacecast_nonnull_vector_keep(<2 x ptr addrspace(1)> %a) {
+  %op = addrspacecast nonnull <2 x ptr addrspace(1)> %a to <2 x ptr>
+  ret <2 x ptr> %op
 }

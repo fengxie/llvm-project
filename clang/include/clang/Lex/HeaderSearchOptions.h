@@ -11,7 +11,6 @@
 
 #include "clang/Basic/LLVM.h"
 #include "llvm/ADT/CachedHashString.h"
-#include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/HashBuilder.h"
@@ -35,9 +34,6 @@ enum IncludeDirGroup {
 
   /// Paths for '\#include <>' added by '-I'.
   Angled,
-
-  /// Like Angled, but marks header maps used when building frameworks.
-  IndexHeaderMap,
 
   /// Like Angled, but marks system directories.
   System,
@@ -184,9 +180,12 @@ public:
   /// loading.
   uint64_t BuildSessionTimestamp = 0;
 
-  /// The set of macro names that should be ignored for the purposes
-  /// of computing the module hash.
+  /// The set of macro names that should be ignored by implicitly-built modules.
   llvm::SmallSetVector<llvm::CachedHashString, 16> ModulesIgnoreMacros;
+
+  /// The set of header search paths that should be ignored by implicitly-built
+  /// modules.
+  llvm::SmallSetVector<llvm::CachedHashString, 16> ModulesIgnoreSearchPaths;
 
   /// The set of user-provided virtual filesystem overlay files.
   std::vector<std::string> VFSOverlayFiles;
@@ -221,6 +220,11 @@ public:
   LLVM_PREFERRED_TYPE(bool)
   unsigned ModulesValidateSystemHeaders : 1;
 
+  /// Whether to force the validation of user input files when a module is
+  /// loaded (even despite the build session saying that is not necessary).
+  LLVM_PREFERRED_TYPE(bool)
+  unsigned ModulesForceValidateUserHeaders : 1;
+
   // Whether the content of input files should be hashed and used to
   // validate consistency.
   LLVM_PREFERRED_TYPE(bool)
@@ -239,6 +243,7 @@ public:
 
   /// Whether to entirely skip writing diagnostic options.
   /// Primarily used to speed up deserialization during dependency scanning.
+  /// FIXME: Consider moving these into separate `SerializationOptions` class.
   LLVM_PREFERRED_TYPE(bool)
   unsigned ModulesSkipDiagnosticOptions : 1;
 
@@ -259,6 +264,10 @@ public:
   LLVM_PREFERRED_TYPE(bool)
   unsigned ModulesHashContent : 1;
 
+  /// Whether AST files should only contain the preprocessor information.
+  LLVM_PREFERRED_TYPE(bool)
+  unsigned ModulesSerializeOnlyPreprocessor : 1;
+
   /// Whether we should include all things that could impact the module in the
   /// hash.
   ///
@@ -271,6 +280,17 @@ public:
   LLVM_PREFERRED_TYPE(bool)
   unsigned ModulesIncludeVFSUsage : 1;
 
+  /// Whether we should look for a module in module maps only in provided
+  /// header search paths or if we are allowed to look for module maps in
+  /// subdirectories of provided paths too.
+  LLVM_PREFERRED_TYPE(bool)
+  unsigned AllowModuleMapSubdirectorySearch : 1;
+
+  /// Whether modules from module maps should only be loaded when used, not just
+  /// when parsed.
+  LLVM_PREFERRED_TYPE(bool)
+  unsigned LazyLoadModuleMaps : 1;
+
   HeaderSearchOptions(StringRef _Sysroot = "/")
       : Sysroot(_Sysroot), ModuleFormat("raw"), DisableModuleHash(false),
         ImplicitModuleMaps(false), ModuleMapFileHomeIsCwd(false),
@@ -279,6 +299,7 @@ public:
         UseStandardCXXIncludes(true), UseLibcxx(false), Verbose(false),
         ModulesValidateOncePerBuildSession(false),
         ModulesValidateSystemHeaders(false),
+        ModulesForceValidateUserHeaders(true),
         ValidateASTInputFilesContent(false),
         ForceCheckCXX20ModulesInputFiles(false), UseDebugInfo(false),
         ModulesValidateDiagnosticOptions(true),
@@ -286,7 +307,9 @@ public:
         ModulesSkipHeaderSearchPaths(false),
         ModulesSkipPragmaDiagnosticMappings(false),
         ModulesPruneNonAffectingModuleMaps(true), ModulesHashContent(false),
-        ModulesStrictContextHash(false), ModulesIncludeVFSUsage(false) {}
+        ModulesSerializeOnlyPreprocessor(false),
+        ModulesStrictContextHash(false), ModulesIncludeVFSUsage(false),
+        AllowModuleMapSubdirectorySearch(true), LazyLoadModuleMaps(false) {}
 
   /// AddPath - Add the \p Path path to the specified \p Group list.
   void AddPath(StringRef Path, frontend::IncludeDirGroup Group,
@@ -310,19 +333,10 @@ public:
   }
 };
 
-inline llvm::hash_code hash_value(const HeaderSearchOptions::Entry &E) {
-  return llvm::hash_combine(E.Path, E.Group, E.IsFramework, E.IgnoreSysRoot);
-}
-
 template <typename HasherT, llvm::endianness Endianness>
 inline void addHash(llvm::HashBuilder<HasherT, Endianness> &HBuilder,
                     const HeaderSearchOptions::Entry &E) {
   HBuilder.add(E.Path, E.Group, E.IsFramework, E.IgnoreSysRoot);
-}
-
-inline llvm::hash_code
-hash_value(const HeaderSearchOptions::SystemHeaderPrefix &SHP) {
-  return llvm::hash_combine(SHP.Prefix, SHP.IsSystemHeader);
 }
 
 template <typename HasherT, llvm::endianness Endianness>

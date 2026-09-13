@@ -1,19 +1,14 @@
 ;; Tests memprof when contains internal linkage function.
 
-;; Avoid failures on big-endian systems that can't read the profile properly
-; REQUIRES: x86_64-linux
+; RUN: rm -rf %t && split-file %s %t
 
-;; TODO: Use text profile inputs once that is available for memprof.
-;; # To update the Inputs below, run Inputs/update_memprof_inputs.sh.
-;; # To generate below LLVM IR for use in matching.
-;; $ clang++ -gmlt -fdebug-info-for-profiling -S %S/Inputs/memprof_internal_linkage.cc -emit-llvm -funique-internal-linkage-names
-
-; RUN: llvm-profdata merge %S/Inputs/memprof_internal_linkage.memprofraw --profiled-binary %S/Inputs/memprof_internal_linkage.exe -o %t.memprofdata
-; RUN: opt < %s -passes='memprof-use<profile-filename=%t.memprofdata>' -S | FileCheck %s
+; RUN: llvm-profdata merge %t/a.yaml -o %t/a.memprofdata
+; RUN: opt < %t/a.ll -passes='memprof-use<profile-filename=%t/a.memprofdata>' -S | FileCheck %s
 
 ; CHECK: call {{.*}} @_Znam{{.*}} #[[ATTR:[0-9]+]]
 ; CHECK: attributes #[[ATTR]] = { builtin allocsize(0) "memprof"="notcold" }
 
+;--- a.ll
 ; ModuleID = 'memprof_internal_linkage.cc'
 source_filename = "memprof_internal_linkage.cc"
 target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
@@ -28,12 +23,12 @@ entry:
   store i32 0, ptr %retval, align 4
   store i32 %argc, ptr %argc.addr, align 4
   store ptr %argv, ptr %argv.addr, align 8
-  call void @_ZL3foov.__uniq.231888424933890731874095357293037629092() #4, !dbg !14
+  call void @_ZL3foov.__uniq.246575255519150625886541854978321354160() #4, !dbg !14
   ret i32 0, !dbg !15
 }
 
 ; Function Attrs: mustprogress noinline optnone uwtable
-define internal void @_ZL3foov.__uniq.231888424933890731874095357293037629092() #1 !dbg !16 {
+define internal void @_ZL3foov.__uniq.246575255519150625886541854978321354160() #1 !dbg !16 {
 entry:
   %a = alloca ptr, align 8
   %call = call noalias noundef nonnull ptr @_Znam(i64 noundef 20) #5, !dbg !17
@@ -76,9 +71,28 @@ attributes #5 = { builtin allocsize(0) }
 !13 = !{}
 !14 = !DILocation(line: 8, column: 3, scope: !10)
 !15 = !DILocation(line: 9, column: 3, scope: !10)
-!16 = distinct !DISubprogram(name: "foo", linkageName: "_ZL3foov.__uniq.231888424933890731874095357293037629092", scope: !11, file: !11, line: 3, type: !12, scopeLine: 3, flags: DIFlagPrototyped, spFlags: DISPFlagLocalToUnit | DISPFlagDefinition, unit: !0)
+!16 = distinct !DISubprogram(name: "foo", linkageName: "_ZL3foov.__uniq.246575255519150625886541854978321354160", scope: !11, file: !11, line: 3, type: !12, scopeLine: 3, flags: DIFlagPrototyped, spFlags: DISPFlagLocalToUnit | DISPFlagDefinition, unit: !0)
 !17 = !DILocation(line: 4, column: 12, scope: !16)
 !18 = !DILocation(line: 4, column: 8, scope: !16)
 !19 = !DILocation(line: 5, column: 10, scope: !16)
 !20 = !DILocation(line: 5, column: 3, scope: !16)
 !21 = !DILocation(line: 6, column: 1, scope: !16)
+
+;--- a.yaml
+---
+HeapProfileRecords:
+  - GUID:            main
+    CallSites:
+      - Frames:
+          - { Function: main, LineOffset: 1, Column: 3, IsInlineFrame: false }
+  - GUID:            _ZL3foov.__uniq.246575255519150625886541854978321354160
+    AllocSites:
+      - Callstack:
+          - { Function: _ZL3foov.__uniq.246575255519150625886541854978321354160, LineOffset: 1, Column: 12, IsInlineFrame: false }
+          - { Function: main, LineOffset: 1, Column: 3, IsInlineFrame: false }
+        MemInfoBlock:
+          AllocCount:      1
+          TotalSize:       20
+          TotalLifetime:   0
+          TotalLifetimeAccessDensity: 5000
+...

@@ -19,6 +19,8 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h"
 #include "llvm/ExecutionEngine/Orc/Shared/SimplePackedSerialization.h"
+#include "llvm/ExecutionEngine/Orc/Shared/WrapperFunctionUtils.h"
+#include "llvm/Support/Compiler.h"
 #include "llvm/Support/Error.h"
 
 #include <atomic>
@@ -30,8 +32,8 @@ namespace llvm {
 namespace orc {
 
 namespace SimpleRemoteEPCDefaultBootstrapSymbolNames {
-extern const char *ExecutorSessionObjectName;
-extern const char *DispatchFnName;
+LLVM_ABI extern const char *ExecutorSessionObjectName;
+LLVM_ABI extern const char *DispatchFnName;
 } // end namespace SimpleRemoteEPCDefaultBootstrapSymbolNames
 
 enum class SimpleRemoteEPCOpcode : uint8_t {
@@ -49,9 +51,23 @@ struct SimpleRemoteEPCExecutorInfo {
   StringMap<ExecutorAddr> BootstrapSymbols;
 };
 
-using SimpleRemoteEPCArgBytesVector = SmallVector<char, 128>;
+/// Encode an Error as the payload of a Hangup message.
+///
+/// A Hangup always carries a serialized Error saying why the session is ending:
+/// a success value for an orderly disconnect, otherwise the reason. Both ends
+/// of the protocol encode and decode hangups through these two functions, so
+/// that their idea of the payload format cannot drift apart.
+LLVM_ABI shared::WrapperFunctionBuffer encodeHangupPayload(Error Err);
 
-class SimpleRemoteEPCTransportClient {
+/// Decode a Hangup payload produced by encodeHangupPayload.
+///
+/// Returns the encoded Error, or an Error describing the payload if it cannot
+/// be decoded -- including an empty payload, which is never valid. Both
+/// outcomes end the session with an error; they are distinguished only by the
+/// message.
+LLVM_ABI Error decodeHangupPayload(shared::WrapperFunctionBuffer Payload);
+
+class LLVM_ABI SimpleRemoteEPCTransportClient {
 public:
   enum HandleMessageAction { ContinueSession, EndSession };
 
@@ -64,7 +80,7 @@ public:
   /// otherwise.
   virtual Expected<HandleMessageAction>
   handleMessage(SimpleRemoteEPCOpcode OpC, uint64_t SeqNo, ExecutorAddr TagAddr,
-                SimpleRemoteEPCArgBytesVector ArgBytes) = 0;
+                shared::WrapperFunctionBuffer ArgBytes) = 0;
 
   /// Handle a disconnection from the underlying transport. No further messages
   /// should be sent to handleMessage after this is called.
@@ -75,7 +91,7 @@ public:
   virtual void handleDisconnect(Error Err) = 0;
 };
 
-class SimpleRemoteEPCTransport {
+class LLVM_ABI SimpleRemoteEPCTransport {
 public:
   virtual ~SimpleRemoteEPCTransport();
 
@@ -100,7 +116,7 @@ public:
 };
 
 /// Uses read/write on FileDescriptors for transport.
-class FDSimpleRemoteEPCTransport : public SimpleRemoteEPCTransport {
+class LLVM_ABI FDSimpleRemoteEPCTransport : public SimpleRemoteEPCTransport {
 public:
   /// Create a FDSimpleRemoteEPCTransport using the given FDs for
   /// reading (InFD) and writing (OutFD).

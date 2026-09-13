@@ -1,4 +1,5 @@
 ; RUN: opt -S -wasm-add-missing-prototypes %s | FileCheck %s
+; RUN: opt -S -passes=wasm-add-missing-prototypes %s | FileCheck %s
 
 target datalayout = "e-m:e-p:32:32-i64:64-n32:64-S128"
 target triple = "wasm32-unknown-unknown"
@@ -36,9 +37,11 @@ define ptr @to_intptr_constexpr() {
 }
 
 ; CHECK-LABEL: @null_compare
-; CHECK: br i1 icmp eq (ptr @foo, ptr null), label %if.then, label %if.end
+; CHECK: %cmp = icmp eq ptr @foo, null
+; CHECK: br i1 %cmp, label %if.then, label %if.end
 define i8 @null_compare() {
-  br i1 icmp eq (ptr @foo, ptr null), label %if.then, label %if.end
+  %cmp = icmp eq ptr @foo, null
+  br i1 %cmp, label %if.then, label %if.end
 if.then:
   ret i8 0
 if.end:

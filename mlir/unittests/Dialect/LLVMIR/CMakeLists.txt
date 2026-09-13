@@ -1,7 +1,9 @@
 add_mlir_unittest(MLIRLLVMIRTests
+  LLVMAttrsTest.cpp
   LLVMTypeTest.cpp
 )
-target_link_libraries(MLIRLLVMIRTests
+mlir_target_link_libraries(MLIRLLVMIRTests
   PRIVATE
+  MLIRFuncDialect
   MLIRLLVMDialect
   )

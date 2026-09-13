@@ -9,10 +9,11 @@
 #ifndef LLVM_LIBC_TYPES_PTHREAD_ATTR_T_H
 #define LLVM_LIBC_TYPES_PTHREAD_ATTR_T_H
 
-#include "llvm-libc-types/size_t.h"
+#include "size_t.h"
 
 typedef struct {
   int __detachstate;
+  int __schedpolicy;
   void *__stack;
   size_t __stacksize;
   size_t __guardsize;

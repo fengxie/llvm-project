@@ -9,6 +9,8 @@ class TEST_Op<string mnemonic, list<Trait> traits = []> :
     Op<TEST_Dialect, mnemonic, traits>;
 
 def CustomResource : Resource<"CustomResource">;
+def ParameterizedResource : Resource<"CustomResource",
+    [{::mlir::StringAttr::get(getContext(), "parameter")}]>;
 
 def SideEffectOpA : TEST_Op<"side_effect_op_a"> {
   let arguments = (ins
@@ -24,17 +26,42 @@ def SideEffectOpA : TEST_Op<"side_effect_op_a"> {
 def SideEffectOpB : TEST_Op<"side_effect_op_b",
     [MemoryEffects<[MemWrite<CustomResource, 0>]>]>;
 
+def SideEffectOpC : TEST_Op<"side_effect_op_c"> {
+  let arguments = (ins Arg<AnyMemRef, "", [MemRead<ParameterizedResource>]>);
+}
+
+def SideEffectOpD : TEST_Op<"side_effect_op_d",
+    [MemoryEffects<[MemWrite<ParameterizedResource>]>]>;
+
 // CHECK: void SideEffectOpA::getEffects
-// CHECK:   for (::mlir::Value value : getODSOperands(0))
-// CHECK:     effects.emplace_back(::mlir::MemoryEffects::Read::get(), value, 0, false, ::mlir::SideEffects::DefaultResource::get());
-// CHECK:   for (::mlir::Value value : getODSOperands(1))
-// CHECK:     effects.emplace_back(::mlir::MemoryEffects::Write::get(), value, 1, true, ::mlir::SideEffects::DefaultResource::get());
+// CHECK:  {
+// CHECK:    auto valueRange = getODSOperandIndexAndLength(0);
+// CHECK:    for (unsigned idx = valueRange.first; idx < valueRange.first + valueRange.second; idx++) {
+// CHECK:      effects.emplace_back(::mlir::MemoryEffects::Read::get(), &getOperation()->getOpOperand(idx), 0, false, ::mlir::SideEffects::DefaultResource::get());
+// CHECK:    }
+// CHECK:  }
+// CHECK:  {
+// CHECK:    auto valueRange = getODSOperandIndexAndLength(1);
+// CHECK:    for (unsigned idx = valueRange.first; idx < valueRange.first + valueRange.second; idx++) {
+// CHECK:      effects.emplace_back(::mlir::MemoryEffects::Write::get(), &getOperation()->getOpOperand(idx), 1, true, ::mlir::SideEffects::DefaultResource::get());
+// CHECK:    }
+// CHECK:  }
 // CHECK:   effects.emplace_back(::mlir::MemoryEffects::Read::get(), getSymbolAttr(), 0, false, ::mlir::SideEffects::DefaultResource::get());
 // CHECK:   effects.emplace_back(::mlir::MemoryEffects::Write::get(), getFlatSymbolAttr(), 0, false, ::mlir::SideEffects::DefaultResource::get());
 // CHECK:   if (auto symbolRef = getOptionalSymbolAttr())
 // CHECK:     effects.emplace_back(::mlir::MemoryEffects::Read::get(), symbolRef, 0, false, ::mlir::SideEffects::DefaultResource::get());
-// CHECK:   for (::mlir::Value value : getODSResults(0))
-// CHECK:     effects.emplace_back(::mlir::MemoryEffects::Allocate::get(), value, 0, false, CustomResource::get());
+// CHECK:  {
+// CHECK:    auto valueRange = getODSResultIndexAndLength(0);
+// CHECK:    for (unsigned idx = valueRange.first; idx < valueRange.first + valueRange.second; idx++) {
+// CHECK:      effects.emplace_back(::mlir::MemoryEffects::Allocate::get(), getOperation()->getOpResult(idx), 0, false, CustomResource::get());
+// CHECK:    }
+// CHECK:  }
 
 // CHECK: void SideEffectOpB::getEffects
 // CHECK:   effects.emplace_back(::mlir::MemoryEffects::Write::get(), 0, false, CustomResource::get());
+
+// CHECK-LABEL: void SideEffectOpC::getEffects
+// CHECK: "parameter"), 0, false, CustomResource::get());
+
+// CHECK-LABEL: void SideEffectOpD::getEffects
+// CHECK: "parameter"), 0, false, CustomResource::get());

@@ -8,6 +8,7 @@
 
 // UNSUPPORTED: c++03, c++11, c++14, c++17
 
+#include <cstddef>
 #include <iterator>
 
 #include "test_iterators.h"
@@ -21,6 +22,7 @@ struct unsized_it {
   using difference_type = std::ptrdiff_t;
 
   value_type& operator*() const;
+  unsized_it& operator++();
   bool operator==(const unsized_it&) const;
   difference_type operator-(const unsized_it&) const { return 0; }
 };

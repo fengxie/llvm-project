@@ -30,7 +30,6 @@
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
-#include <memory>
 #include <tuple>
 
 using namespace llvm;
@@ -152,8 +151,8 @@ raw_ostream &operator<<(raw_ostream &OS, const UseInfo<CalleeTy> &U) {
 /// Calculate the allocation size of a given alloca. Returns empty range
 // in case of confution.
 ConstantRange getStaticAllocaSizeRange(const AllocaInst &AI) {
-  const DataLayout &DL = AI.getModule()->getDataLayout();
-  TypeSize TS = DL.getTypeAllocSize(AI.getAllocatedType());
+  const DataLayout &DL = AI.getDataLayout();
+  TypeSize TS = AI.getAllocationBaseSize(DL);
   unsigned PointerSize = DL.getPointerTypeSizeInBits(AI.getType());
   // Fallback to empty range for alloca size.
   ConstantRange R = ConstantRange::getEmpty(PointerSize);
@@ -268,7 +267,7 @@ class StackSafetyLocalAnalysis {
 
 public:
   StackSafetyLocalAnalysis(Function &F, ScalarEvolution &SE)
-      : F(F), DL(F.getParent()->getDataLayout()), SE(SE),
+      : F(F), DL(F.getDataLayout()), SE(SE),
         PointerSize(DL.getPointerSizeInBits()),
         UnknownRange(PointerSize, true) {}
 
@@ -528,7 +527,8 @@ void StackSafetyLocalAnalysis::analyzeAllUses(Value *Ptr,
         // dso_preemptable aliases or aliases with interposable linkage.
         const GlobalValue *Callee =
             dyn_cast<GlobalValue>(CB.getCalledOperand()->stripPointerCasts());
-        if (!Callee) {
+        if (!Callee || isa<GlobalIFunc>(Callee) ||
+            isa<GlobalVariable>(Callee)) {
           US.addRange(I, UnknownRange, /*IsSafe=*/false);
           break;
         }
@@ -672,8 +672,7 @@ void StackSafetyDataFlowAnalysis<CalleeTy>::updateOneNode(
                       << (UpdateToFullSet ? ", full-set" : "") << "] " << &FS
                       << "\n");
     // Callers of this function may need updating.
-    for (auto &CallerID : Callers[Callee])
-      WorkList.insert(CallerID);
+    WorkList.insert_range(Callers[Callee]);
 
     ++FS.UpdateCount;
   }
@@ -690,7 +689,7 @@ void StackSafetyDataFlowAnalysis<CalleeTy>::runDataFlow() {
         Callees.push_back(CS.first.Callee);
 
     llvm::sort(Callees);
-    Callees.erase(std::unique(Callees.begin(), Callees.end()), Callees.end());
+    Callees.erase(llvm::unique(Callees), Callees.end());
 
     for (auto &Callee : Callees)
       Callers[Callee].push_back(F.first);
@@ -852,7 +851,7 @@ GVToSSI createGlobalStackSafetyInfo(
     }
 
   uint32_t PointerSize =
-      Copy.begin()->first->getParent()->getDataLayout().getPointerSizeInBits();
+      Copy.begin()->first->getDataLayout().getPointerSizeInBits();
   StackSafetyDataFlowAnalysis<GlobalValue> SSDFA(PointerSize, std::move(Copy));
 
   for (const auto &F : SSDFA.run()) {
@@ -901,7 +900,7 @@ const StackSafetyInfo::InfoTy &StackSafetyInfo::getInfo() const {
 }
 
 void StackSafetyInfo::print(raw_ostream &O) const {
-  getInfo().Info.print(O, F->getName(), dyn_cast<Function>(F));
+  getInfo().Info.print(O, F->getName(), F);
   O << "\n";
 }
 
@@ -1049,9 +1048,7 @@ PreservedAnalyses StackSafetyPrinterPass::run(Function &F,
 
 char StackSafetyInfoWrapperPass::ID = 0;
 
-StackSafetyInfoWrapperPass::StackSafetyInfoWrapperPass() : FunctionPass(ID) {
-  initializeStackSafetyInfoWrapperPassPass(*PassRegistry::getPassRegistry());
-}
+StackSafetyInfoWrapperPass::StackSafetyInfoWrapperPass() : FunctionPass(ID) {}
 
 void StackSafetyInfoWrapperPass::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.addRequiredTransitive<ScalarEvolutionWrapperPass>();
@@ -1072,14 +1069,17 @@ AnalysisKey StackSafetyGlobalAnalysis::Key;
 
 StackSafetyGlobalInfo
 StackSafetyGlobalAnalysis::run(Module &M, ModuleAnalysisManager &AM) {
-  // FIXME: Lookup Module Summary.
   FunctionAnalysisManager &FAM =
       AM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
+  const ModuleSummaryIndex *Index = nullptr;
+  if (auto *IndexPass =
+          AM.getCachedResult<ImmutableModuleSummaryIndexAnalysis>(M))
+    Index = IndexPass->getIndex();
   return {&M,
           [&FAM](Function &F) -> const StackSafetyInfo & {
             return FAM.getResult<StackSafetyAnalysis>(F);
           },
-          nullptr};
+          Index};
 }
 
 PreservedAnalyses StackSafetyGlobalPrinterPass::run(Module &M,
@@ -1092,10 +1092,7 @@ PreservedAnalyses StackSafetyGlobalPrinterPass::run(Module &M,
 char StackSafetyGlobalInfoWrapperPass::ID = 0;
 
 StackSafetyGlobalInfoWrapperPass::StackSafetyGlobalInfoWrapperPass()
-    : ModulePass(ID) {
-  initializeStackSafetyGlobalInfoWrapperPassPass(
-      *PassRegistry::getPassRegistry());
-}
+    : ModulePass(ID) {}
 
 StackSafetyGlobalInfoWrapperPass::~StackSafetyGlobalInfoWrapperPass() = default;
 
@@ -1142,7 +1139,7 @@ void llvm::generateParamAccessSummary(ModuleSummaryIndex &Index) {
     if (!AreStatisticsEnabled())
       return;
     for (auto &GVS : Index)
-      for (auto &GV : GVS.second.SummaryList)
+      for (auto &GV : GVS.second.getSummaryList())
         if (FunctionSummary *FS = dyn_cast<FunctionSummary>(GV.get()))
           Stat += FS->paramAccesses().size();
   };
@@ -1153,7 +1150,7 @@ void llvm::generateParamAccessSummary(ModuleSummaryIndex &Index) {
 
   // Convert the ModuleSummaryIndex to a FunctionMap
   for (auto &GVS : Index) {
-    for (auto &GV : GVS.second.SummaryList) {
+    for (auto &GV : GVS.second.getSummaryList()) {
       FunctionSummary *FS = dyn_cast<FunctionSummary>(GV.get());
       if (!FS || FS->paramAccesses().empty())
         continue;

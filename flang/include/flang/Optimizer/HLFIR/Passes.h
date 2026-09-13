@@ -13,6 +13,8 @@
 #ifndef FORTRAN_OPTIMIZER_HLFIR_PASSES_H
 #define FORTRAN_OPTIMIZER_HLFIR_PASSES_H
 
+#include "flang/Optimizer/Support/AllocationPolicy.h"
+#include "flang/Support/FPMaxminBehavior.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassRegistry.h"
@@ -20,11 +22,6 @@
 
 namespace hlfir {
 #define GEN_PASS_DECL
-#include "flang/Optimizer/HLFIR/Passes.h.inc"
-
-std::unique_ptr<mlir::Pass> createConvertHLFIRtoFIRPass();
-std::unique_ptr<mlir::Pass> createBufferizeHLFIRPass();
-
 #define GEN_PASS_REGISTRATION
 #include "flang/Optimizer/HLFIR/Passes.h.inc"
 } // namespace hlfir

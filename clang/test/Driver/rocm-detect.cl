@@ -1,5 +1,3 @@
-// REQUIRES: amdgpu-registered-target
-
 // Make sure the appropriate device specific library is available.
 
 // We don't include every target in the test directory, so just pick a valid
@@ -18,4 +16,4 @@
 
 // NODEFAULTLIBS-NOT: error: cannot find
 
-// COMMON: "-triple" "amdgcn-amd-amdhsa"
+// COMMON: "-triple" "amdgpu9.02-amd-amdhsa"

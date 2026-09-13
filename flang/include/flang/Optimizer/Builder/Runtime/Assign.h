@@ -56,18 +56,24 @@ void genAssignExplicitLengthCharacter(fir::FirOpBuilder &builder,
 void genAssignTemporary(fir::FirOpBuilder &builder, mlir::Location loc,
                         mlir::Value destBox, mlir::Value sourceBox);
 
-/// Generate runtime call to CopyOutAssign to assign \p sourceBox to
-/// \p destBox. This call implements the copy-out of a temporary
-/// (\p sourceBox) to the actual argument (\p destBox) passed to a procedure,
-/// after the procedure returns to the caller.
-/// If \p skipToInit is false, then \p destBox will be initialized before
-/// the assignment, otherwise, it is assumed to be already initialized.
-/// The runtime makes sure that there is no reallocation of the top-level
-/// entity represented by \p destBox. If reallocation is required
-/// for the components of \p destBox, then it is done without finalization.
+/// Generate runtime call to "CopyInAssign" runtime API.
+void genCopyInAssign(fir::FirOpBuilder &builder, mlir::Location loc,
+                     mlir::Value tempBoxAddr, mlir::Value varBoxAddr);
+/// Generate runtime call to "CopyOutAssign" runtime API.
 void genCopyOutAssign(fir::FirOpBuilder &builder, mlir::Location loc,
-                      mlir::Value destBox, mlir::Value sourceBox,
-                      bool skipToInit);
+                      mlir::Value varBoxAddr, mlir::Value tempBoxAddr);
+
+/// Generate runtime call to AssignSimple (fast path for intrinsic types).
+/// \p destBox must be a fir.ref<fir.box<T>> and \p sourceBox a fir.box<T>.
+/// Preconditions enforced at call site:
+///   - Intrinsic element type (integer, real, complex, logical)
+///   - Matching ranks (no scalar-to-array broadcasting)
+///   - Same element byte size
+///   - Non-volatile
+/// Runtime handles: contiguous and non-contiguous layouts, aliasing detection,
+/// allocatable reallocation.
+void genAssignSimple(fir::FirOpBuilder &builder, mlir::Location loc,
+                     mlir::Value destBox, mlir::Value sourceBox);
 
 } // namespace fir::runtime
 #endif // FORTRAN_OPTIMIZER_BUILDER_RUNTIME_ASSIGN_H

@@ -12,7 +12,7 @@ from lldbsuite.test.lldbtest import *
 class TestSuspendedThreadHandling(TestBase):
     NO_DEBUG_INFO_TESTCASE = True
 
-    @skipUnlessDarwin
+    @requireDarwin
     def test_suspended_threads(self):
         """Test that debugserver doesn't disturb the suspend count of a thread
         that has been suspended from within a program, when navigating breakpoints
@@ -92,7 +92,7 @@ class TestSuspendedThreadHandling(TestBase):
         thread = lldb.SBThread()
         for thread in process.threads:
             th_name = thread.GetName()
-            if th_name == None:
+            if th_name is None:
                 continue
             if "Look for me" in th_name:
                 break

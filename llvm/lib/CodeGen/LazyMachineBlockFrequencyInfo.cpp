@@ -15,6 +15,7 @@
 
 #include "llvm/CodeGen/LazyMachineBlockFrequencyInfo.h"
 #include "llvm/CodeGen/MachineBranchProbabilityInfo.h"
+#include "llvm/CodeGen/MachineCycleAnalysis.h"
 #include "llvm/InitializePasses.h"
 
 using namespace llvm;
@@ -23,71 +24,52 @@ using namespace llvm;
 
 INITIALIZE_PASS_BEGIN(LazyMachineBlockFrequencyInfoPass, DEBUG_TYPE,
                       "Lazy Machine Block Frequency Analysis", true, true)
-INITIALIZE_PASS_DEPENDENCY(MachineBranchProbabilityInfo)
-INITIALIZE_PASS_DEPENDENCY(MachineLoopInfo)
+INITIALIZE_PASS_DEPENDENCY(MachineBranchProbabilityInfoWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(MachineCycleInfoWrapperPass)
 INITIALIZE_PASS_END(LazyMachineBlockFrequencyInfoPass, DEBUG_TYPE,
                     "Lazy Machine Block Frequency Analysis", true, true)
 
 char LazyMachineBlockFrequencyInfoPass::ID = 0;
 
 LazyMachineBlockFrequencyInfoPass::LazyMachineBlockFrequencyInfoPass()
-    : MachineFunctionPass(ID) {
-  initializeLazyMachineBlockFrequencyInfoPassPass(
-      *PassRegistry::getPassRegistry());
-}
-
-void LazyMachineBlockFrequencyInfoPass::print(raw_ostream &OS,
-                                              const Module *M) const {
-  getBFI().print(OS, M);
-}
+    : MachineFunctionPass(ID) {}
 
 void LazyMachineBlockFrequencyInfoPass::getAnalysisUsage(
     AnalysisUsage &AU) const {
-  AU.addRequired<MachineBranchProbabilityInfo>();
+  AU.addRequired<MachineBranchProbabilityInfoWrapperPass>();
   AU.setPreservesAll();
   MachineFunctionPass::getAnalysisUsage(AU);
 }
 
 void LazyMachineBlockFrequencyInfoPass::releaseMemory() {
   OwnedMBFI.reset();
-  OwnedMLI.reset();
-  OwnedMDT.reset();
+  OwnedMCI.reset();
 }
 
 MachineBlockFrequencyInfo &
 LazyMachineBlockFrequencyInfoPass::calculateIfNotAvailable() const {
-  auto *MBFI = getAnalysisIfAvailable<MachineBlockFrequencyInfo>();
-  if (MBFI) {
+  auto *MBFIWrapper =
+      getAnalysisIfAvailable<MachineBlockFrequencyInfoWrapperPass>();
+  if (MBFIWrapper) {
     LLVM_DEBUG(dbgs() << "MachineBlockFrequencyInfo is available\n");
-    return *MBFI;
+    return MBFIWrapper->getMBFI();
   }
 
-  auto &MBPI = getAnalysis<MachineBranchProbabilityInfo>();
-  auto *MLI = getAnalysisIfAvailable<MachineLoopInfo>();
-  auto *MDT = getAnalysisIfAvailable<MachineDominatorTree>();
+  auto &MBPI = getAnalysis<MachineBranchProbabilityInfoWrapperPass>().getMBPI();
+  auto *MCIWrapper = getAnalysisIfAvailable<MachineCycleInfoWrapperPass>();
+  auto *MCI = MCIWrapper ? &MCIWrapper->getCycleInfo() : nullptr;
   LLVM_DEBUG(dbgs() << "Building MachineBlockFrequencyInfo on the fly\n");
-  LLVM_DEBUG(if (MLI) dbgs() << "LoopInfo is available\n");
+  LLVM_DEBUG(if (MCI) dbgs() << "CycleInfo is available\n");
 
-  if (!MLI) {
-    LLVM_DEBUG(dbgs() << "Building LoopInfo on the fly\n");
-    // First create a dominator tree.
-    LLVM_DEBUG(if (MDT) dbgs() << "DominatorTree is available\n");
-
-    if (!MDT) {
-      LLVM_DEBUG(dbgs() << "Building DominatorTree on the fly\n");
-      OwnedMDT = std::make_unique<MachineDominatorTree>();
-      OwnedMDT->getBase().recalculate(*MF);
-      MDT = OwnedMDT.get();
-    }
-
-    // Generate LoopInfo from it.
-    OwnedMLI = std::make_unique<MachineLoopInfo>();
-    OwnedMLI->getBase().analyze(MDT->getBase());
-    MLI = OwnedMLI.get();
+  if (!MCI) {
+    LLVM_DEBUG(dbgs() << "Building CycleInfo on the fly\n");
+    OwnedMCI = std::make_unique<MachineCycleInfo>();
+    OwnedMCI->compute(*MF);
+    MCI = OwnedMCI.get();
   }
 
   OwnedMBFI = std::make_unique<MachineBlockFrequencyInfo>();
-  OwnedMBFI->calculate(*MF, MBPI, *MLI);
+  OwnedMBFI->calculate(*MF, MBPI, *MCI);
   return *OwnedMBFI;
 }
 

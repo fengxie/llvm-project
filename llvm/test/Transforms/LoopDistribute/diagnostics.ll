@@ -32,9 +32,6 @@
 ;    18   }
 ;    19 }
 
-target datalayout = "e-m:o-i64:64-f80:128-n8:16:32:64-S128"
-target triple = "x86_64-apple-macosx10.11.0"
-
 ; MISSED_REMARKS: remark:  /tmp/t.c:3:3: loop not distributed: use -Rpass-analysis=loop-distribute for more info
 ; ALWAYS:         remark: /tmp/t.c:3:3: loop not distributed: memory operations are safe for vectorization
 ; ALWAYS:         warning: /tmp/t.c:3:3: loop not distributed: failed explicitly specified loop distribution
@@ -197,7 +194,7 @@ attributes #1 = { nounwind convergent }
 !18 = !DILocation(line: 4, column: 5, scope: !7)
 !19 = !DILocation(line: 4, column: 10, scope: !7)
 !20 = distinct !{!20, !21}
-!21 = !{!"llvm.loop.distribute.enable", i1 true}
+!21 = !{!"llvm.loop.distribute.enable"}
 !22 = distinct !DISubprogram(name: "not_forced", scope: !1, file: !1, line: 8, type: !8, isLocal: false, isDefinition: true, scopeLine: 8, flags: DIFlagPrototyped, isOptimized: true, unit: !0, retainedNodes: !2)
 !23 = !DILocation(line: 9, column: 20, scope: !22)
 !24 = !DILocation(line: 9, column: 3, scope: !22)

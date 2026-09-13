@@ -20,6 +20,10 @@ using namespace llvm::opt;
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #endif
 
+#define OPTTABLE_STR_TABLE_CODE
+#include "Opts.inc"
+#undef OPTTABLE_STR_TABLE_CODE
+
 enum ID {
   OPT_INVALID = 0, // This is not an option ID.
 #define OPTION(...) LLVM_MAKE_OPT_ID(__VA_ARGS__),
@@ -28,20 +32,17 @@ enum ID {
 #undef OPTION
 };
 
-#define PREFIX(NAME, VALUE)                                                    \
-  static constexpr StringLiteral NAME##_init[] = VALUE;                        \
-  static constexpr ArrayRef<StringLiteral> NAME(NAME##_init,                   \
-                                                std::size(NAME##_init) - 1);
+#define OPTTABLE_VALUES_CODE
 #include "Opts.inc"
-#undef PREFIX
+#undef OPTTABLE_VALUES_CODE
 
-static constexpr const StringLiteral PrefixTable_init[] =
-#define PREFIX_UNION(VALUES) VALUES
+#define OPTTABLE_PREFIXES_TABLE_CODE
 #include "Opts.inc"
-#undef PREFIX_UNION
-    ;
-static constexpr const ArrayRef<StringLiteral>
-    PrefixTable(PrefixTable_init, std::size(PrefixTable_init) - 1);
+#undef OPTTABLE_PREFIXES_TABLE_CODE
+
+#define OPTTABLE_PREFIXES_UNION_CODE
+#include "Opts.inc"
+#undef OPTTABLE_PREFIXES_UNION_CODE
 
 enum OptionFlags {
   OptFlag1 = (1 << 4),
@@ -64,13 +65,19 @@ namespace {
 class TestOptTable : public GenericOptTable {
 public:
   TestOptTable(bool IgnoreCase = false)
-      : GenericOptTable(InfoTable, IgnoreCase) {}
+      : GenericOptTable(OptionStrTable, OptionPrefixesTable, InfoTable,
+                        IgnoreCase) {
+    setValuesCodeFn(getOptionValuesCode);
+  }
 };
 
 class TestPrecomputedOptTable : public PrecomputedOptTable {
 public:
   TestPrecomputedOptTable(bool IgnoreCase = false)
-      : PrecomputedOptTable(InfoTable, PrefixTable, IgnoreCase) {}
+      : PrecomputedOptTable(OptionStrTable, OptionPrefixesTable, InfoTable,
+                            OptionPrefixesUnion, IgnoreCase) {
+    setValuesCodeFn(getOptionValuesCode);
+  }
 };
 }
 
@@ -228,6 +235,27 @@ TYPED_TEST(OptTableTest, AliasArgs) {
   EXPECT_TRUE(AL.hasArg(OPT_B));
   EXPECT_EQ("foo", AL.getAllArgValues(OPT_B)[0]);
   EXPECT_EQ("bar", AL.getAllArgValues(OPT_B)[1]);
+}
+
+TYPED_TEST(OptTableTest, AliasArgsMultiple) {
+  TypeParam T;
+  unsigned MAI, MAC;
+
+  const char *MyArgs[] = {"-Jmulti"};
+  InputArgList AL = T.ParseArgs(MyArgs, MAI, MAC);
+  EXPECT_TRUE(AL.hasArg(OPT_D));
+  EXPECT_EQ((std::vector<std::string>{"foo", "bar"}),
+            AL.getAllArgValues(OPT_D));
+}
+
+TYPED_TEST(OptTableTest, SuggestValueCompletions) {
+  TypeParam T;
+
+  EXPECT_EQ((std::vector<std::string>{"inline1", "inline2"}),
+            T.suggestValueCompletions("-values-inline=", ""));
+  // Values computed by ValuesCode live outside the string table.
+  EXPECT_EQ((std::vector<std::string>{"code1", "code2"}),
+            T.suggestValueCompletions("-values-from-code=", ""));
 }
 
 TYPED_TEST(OptTableTest, IgnoreCase) {

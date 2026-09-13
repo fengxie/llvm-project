@@ -61,8 +61,8 @@ func.func @conv(
     // Note the fastmath attributes that allow operations to be recombined into
     //   %0 = math.fma %in, %f, %b : f32
     // later on and to reorder reductions.
-    %m1 = arith.mulf %in, %f  {fastmath = #arith.fastmath<fast>} : f32
-    %0 = arith.addf %b, %m1  {fastmath = #arith.fastmath<fast>} : f32
+    %m1 = arith.mulf %in, %f fastmath<fast> : f32
+    %0 = arith.addf %b, %m1 fastmath<fast> : f32
     linalg.yield %0 : f32
   } -> !toutput
 
@@ -275,7 +275,7 @@ module attributes { transform.with_named_sequence } {
 
     // Vectorize the remaining non-unit dimensions in structured operations.
     // This essentially rewrites operations on `tensor<5x64xf32>` into
-    // opreations on `vector<5x64xf32>`. Further lowering in MLIR and LLVM will
+    // operations on `vector<5x64xf32>`. Further lowering in MLIR and LLVM will
     // decompose this into a sequence of operations on single-dimensional
     // vectors of the platform-relevant size, e.g., `vector<16xf32>` for AVX512.
     // High-level vector primitives, such as `vector.transpose` and
@@ -316,9 +316,8 @@ module attributes { transform.with_named_sequence } {
     // --pass-pipeline expressions with operations. Note that we apply the
     // pipeline to functions rather than entire module to avoid running it
     // on the transform IR that is contained in the module.
-    %arg1 = transform.bufferization.one_shot_bufferize %arg0 {
-      bufferize_function_boundaries = true,
-      function_boundary_type_conversion = 1 : i32 }
+    %arg1 = transform.bufferization.one_shot_bufferize layout{IdentityLayoutMap}
+      %arg0 <{bufferize_function_boundaries = true}>
       : (!transform.any_op) -> !transform.any_op
     %f = transform.structured.match ops{["func.func"]} in %arg1
       : (!transform.any_op) -> !transform.any_op
@@ -379,28 +378,30 @@ module attributes { transform.with_named_sequence } {
 // The core computation, at the LLVM dialect level, must correspond to five
 // immediately adjacent fma on vector<64xf32>.
 
-// CHECK:      %[[R0:.+]] = llvm.mlir.undef : !llvm.array<5 x vector<64xf32>>
-// CHECK-NEXT: %[[LINE0:.+]] = llvm.extractvalue %[[V:.+]][0] : !llvm.array<5 x vector<64xf32>>
+// CHECK:      %[[R0:.+]] = llvm.mlir.poison : !llvm.array<5 x vector<64xf32>>
+
+// CHECK:      %[[V:.+]] = llvm.load %{{.*}} : !llvm.ptr -> !llvm.array<5 x vector<64xf32>>
+// CHECK-NEXT: %[[LINE0:.+]] = llvm.extractvalue %[[V]][0] : !llvm.array<5 x vector<64xf32>>
 // CHECK-NEXT: %[[FMA0:.+]] = llvm.intr.fma(%{{.*}}, %{{.*}}, %[[LINE0]])
 // CHECK-SAME: -> vector<64xf32>
 // CHECK-NEXT: %[[R1:.+]] = llvm.insertvalue %[[FMA0]], %[[R0]][0]
 
-// CHECK-NEXT: %[[LINE1:.+]] = llvm.extractvalue %[[V:.+]][1] : !llvm.array<5 x vector<64xf32>>
+// CHECK-NEXT: %[[LINE1:.+]] = llvm.extractvalue %[[V]][1] : !llvm.array<5 x vector<64xf32>>
 // CHECK-NEXT: %[[FMA1:.+]] = llvm.intr.fma(%{{.*}}, %{{.*}}, %[[LINE1]])
 // CHECK-SAME: -> vector<64xf32>
 // CHECK-NEXT: %[[R2:.+]] = llvm.insertvalue %[[FMA1]], %[[R1]][1]
 
-// CHECK-NEXT: %[[LINE2:.+]] = llvm.extractvalue %[[V:.+]][2] : !llvm.array<5 x vector<64xf32>>
+// CHECK-NEXT: %[[LINE2:.+]] = llvm.extractvalue %[[V]][2] : !llvm.array<5 x vector<64xf32>>
 // CHECK-NEXT: %[[FMA2:.+]] = llvm.intr.fma(%{{.*}}, %{{.*}}, %[[LINE2]])
 // CHECK-SAME: -> vector<64xf32>
 // CHECK-NEXT: %[[R3:.+]] = llvm.insertvalue %[[FMA2]], %[[R2]][2]
 
-// CHECK-NEXT: %[[LINE3:.+]] = llvm.extractvalue %[[V:.+]][3] : !llvm.array<5 x vector<64xf32>>
+// CHECK-NEXT: %[[LINE3:.+]] = llvm.extractvalue %[[V]][3] : !llvm.array<5 x vector<64xf32>>
 // CHECK-NEXT: %[[FMA3:.+]] = llvm.intr.fma(%{{.*}}, %{{.*}}, %[[LINE3]])
 // CHECK-SAME: -> vector<64xf32>
 // CHECK-NEXT: %[[R4:.+]] = llvm.insertvalue %[[FMA3]], %[[R3]][3]
 
-// CHECK-NEXT: %[[LINE4:.+]] = llvm.extractvalue %[[V:.+]][4] : !llvm.array<5 x vector<64xf32>>
+// CHECK-NEXT: %[[LINE4:.+]] = llvm.extractvalue %[[V]][4] : !llvm.array<5 x vector<64xf32>>
 // CHECK-NEXT: %[[FMA4:.+]] = llvm.intr.fma(%{{.*}}, %{{.*}}, %[[LINE4]])
 // CHECK-SAME: -> vector<64xf32>
 // CHECK-NEXT: %[[R5:.+]] = llvm.insertvalue %[[FMA4]], %[[R4]][4]

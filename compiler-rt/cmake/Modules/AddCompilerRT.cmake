@@ -1,6 +1,7 @@
 include(ExternalProject)
 include(CompilerRTUtils)
 include(HandleCompilerRT)
+include(LLVMVersion)
 
 function(set_target_output_directories target output_dir)
   # For RUNTIME_OUTPUT_DIRECTORY variable, Multi-configuration generators
@@ -22,6 +23,43 @@ function(set_target_output_directories target output_dir)
         LIBRARY_OUTPUT_DIRECTORY ${output_dir}
         RUNTIME_OUTPUT_DIRECTORY ${output_dir})
   endif()
+endfunction()
+
+function(add_compiler_rt_windows_version_resource_file OUT_VAR RESOURCE_VAR name)
+  set(sources ${ARGN})
+  if(MSVC AND CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
+    set(resource_file
+      "${COMPILER_RT_SOURCE_DIR}/resources/windows_version_resource.rc")
+    set(target_resource_file
+      "${CMAKE_CURRENT_BINARY_DIR}/${name}_windows_version_resource.rc")
+    configure_file("${resource_file}" "${target_resource_file}" COPYONLY)
+    list(APPEND sources "${target_resource_file}")
+    source_group("Resource Files" "${target_resource_file}")
+    set(${RESOURCE_VAR} "${target_resource_file}" PARENT_SCOPE)
+  endif()
+  set(${OUT_VAR} ${sources} PARENT_SCOPE)
+endfunction()
+
+function(set_compiler_rt_windows_version_resource_properties name resource_file)
+  if(DEFINED PACKAGE_VERSION AND NOT "${PACKAGE_VERSION}" STREQUAL "")
+    set(version_string "${PACKAGE_VERSION}")
+  else()
+    set(version_string
+      "${LLVM_VERSION_MAJOR}.${LLVM_VERSION_MINOR}.${LLVM_VERSION_PATCH}${LLVM_VERSION_SUFFIX}")
+  endif()
+
+  set_property(SOURCE ${resource_file}
+               PROPERTY COMPILE_FLAGS /nologo)
+  set_property(SOURCE ${resource_file}
+               PROPERTY COMPILE_DEFINITIONS
+               "RC_VERSION_FIELD_1=${LLVM_VERSION_MAJOR}"
+               "RC_VERSION_FIELD_2=${LLVM_VERSION_MINOR}"
+               "RC_VERSION_FIELD_3=${LLVM_VERSION_PATCH}"
+               "RC_VERSION_FIELD_4=0"
+               "RC_FILE_VERSION=\"${version_string}\""
+               "RC_INTERNAL_NAME=\"${name}\""
+               "RC_PRODUCT_NAME=\"compiler-rt\""
+               "RC_PRODUCT_VERSION=\"${version_string}\"")
 endfunction()
 
 # Tries to add an "object library" target for a given list of OSs and/or
@@ -91,7 +129,7 @@ function(add_compiler_rt_object_libraries name)
       ${extra_cflags_${libname}} ${target_flags})
     set_property(TARGET ${libname} APPEND PROPERTY
       COMPILE_DEFINITIONS ${LIB_DEFS})
-    set_target_properties(${libname} PROPERTIES FOLDER "Compiler-RT Libraries")
+    set_target_properties(${libname} PROPERTIES FOLDER "compiler-rt/Libraries")
     if(APPLE)
       set_target_properties(${libname} PROPERTIES
         OSX_ARCHITECTURES "${LIB_ARCHS_${libname}}")
@@ -110,7 +148,7 @@ endmacro()
 
 function(add_compiler_rt_component name)
   add_custom_target(${name})
-  set_target_properties(${name} PROPERTIES FOLDER "Compiler-RT Misc")
+  set_target_properties(${name} PROPERTIES FOLDER "compiler-rt/Components")
   if(COMMAND runtime_register_component)
     runtime_register_component(${name})
   endif()
@@ -123,7 +161,7 @@ macro(set_output_name output name arch)
   else()
     if(ANDROID AND ${arch} STREQUAL "i386")
       set(${output} "${name}-i686${COMPILER_RT_OS_SUFFIX}")
-    elseif("${arch}" MATCHES "^arm")
+    elseif(NOT "${arch}" MATCHES "^arm64" AND "${arch}" MATCHES "^arm")
       if(COMPILER_RT_DEFAULT_TARGET_ONLY)
         set(triple "${COMPILER_RT_DEFAULT_TARGET_TRIPLE}")
       else()
@@ -161,7 +199,9 @@ endmacro()
 #                         LINK_LIBS <linked libraries> (only for shared library)
 #                         OBJECT_LIBS <object libraries to use as sources>
 #                         PARENT_TARGET <convenience parent target>
-#                         ADDITIONAL_HEADERS <header files>)
+#                         ADDITIONAL_HEADERS <header files>
+#                         C_STANDARD <version>
+#                         CXX_STANDARD <version>)
 function(add_compiler_rt_runtime name type)
   if(NOT type MATCHES "^(OBJECT|STATIC|SHARED|MODULE)$")
     message(FATAL_ERROR
@@ -170,16 +210,23 @@ function(add_compiler_rt_runtime name type)
   endif()
   cmake_parse_arguments(LIB
     ""
-    "PARENT_TARGET"
+    "PARENT_TARGET;C_STANDARD;CXX_STANDARD"
     "OS;ARCHS;SOURCES;CFLAGS;LINK_FLAGS;DEFS;DEPS;LINK_LIBS;OBJECT_LIBS;ADDITIONAL_HEADERS"
     ${ARGN})
   set(libnames)
   # Until we support this some other way, build compiler-rt runtime without LTO
-  # to allow non-LTO projects to link with it.
-  if(COMPILER_RT_HAS_FNO_LTO_FLAG)
+  # to allow non-LTO projects to link with it. GPU targets can currently only be
+  # distributed as LLVM-IR and ignore this.
+  if(COMPILER_RT_HAS_FNO_LTO_FLAG AND NOT COMPILER_RT_GPU_BUILD)
     set(NO_LTO_FLAGS "-fno-lto")
   else()
     set(NO_LTO_FLAGS "")
+  endif()
+
+  # The GPU build does not support shared libraries, just suppress them here as
+  # there is no global config for this.
+  if(COMPILER_RT_GPU_BUILD AND type MATCHES "SHARED")
+    return()
   endif()
 
   # By default do not instrument or use profdata for compiler-rt.
@@ -293,7 +340,7 @@ function(add_compiler_rt_runtime name type)
     if(NOT TARGET ${LIB_PARENT_TARGET})
       add_custom_target(${LIB_PARENT_TARGET})
       set_target_properties(${LIB_PARENT_TARGET} PROPERTIES
-                            FOLDER "Compiler-RT Misc")
+                            FOLDER "compiler-rt/Runtimes")
     endif()
   endif()
 
@@ -348,15 +395,32 @@ function(add_compiler_rt_runtime name type)
           DEPENDS ${sources_${libname}}
           COMMENT "Building C object ${output_file_${libname}}")
       add_custom_target(${libname} DEPENDS ${output_dir_${libname}}/${output_file_${libname}})
+      set_target_properties(${libname} PROPERTIES FOLDER "compiler-rt/Codegenning")
       install(FILES ${output_dir_${libname}}/${output_file_${libname}}
         DESTINATION ${install_dir_${libname}}
         ${COMPONENT_OPTION})
     else()
+      unset(windows_resource_file)
+      if(type STREQUAL "SHARED")
+        add_compiler_rt_windows_version_resource_file(
+          sources_${libname} windows_resource_file ${libname}
+          ${sources_${libname}})
+      endif()
       add_library(${libname} ${type} ${sources_${libname}})
+      if(windows_resource_file)
+        set_compiler_rt_windows_version_resource_properties(${libname}
+          ${windows_resource_file})
+      endif()
       set_target_compile_flags(${libname} ${extra_cflags_${libname}})
       set_target_link_flags(${libname} ${extra_link_flags_${libname}})
       set_property(TARGET ${libname} APPEND PROPERTY
                    COMPILE_DEFINITIONS ${LIB_DEFS})
+      if(LIB_C_STANDARD)
+        set_property(TARGET ${libname} PROPERTY C_STANDARD ${LIB_C_STANDARD})
+      endif()
+      if(LIB_CXX_STANDARD)
+        set_property(TARGET ${libname} PROPERTY CXX_STANDARD ${LIB_CXX_STANDARD})
+      endif()
       set_target_output_directories(${libname} ${output_dir_${libname}})
       install(TARGETS ${libname}
         ARCHIVE DESTINATION ${install_dir_${libname}}
@@ -370,8 +434,8 @@ function(add_compiler_rt_runtime name type)
       add_dependencies(${libname} ${LIB_DEPS})
     endif()
     set_target_properties(${libname} PROPERTIES
-        OUTPUT_NAME ${output_name_${libname}})
-    set_target_properties(${libname} PROPERTIES FOLDER "Compiler-RT Runtime")
+        OUTPUT_NAME ${output_name_${libname}}
+        FOLDER "compiler-rt/Runtimes")
     if(LIB_LINK_LIBS)
       target_link_libraries(${libname} PRIVATE ${LIB_LINK_LIBS})
     endif()
@@ -385,37 +449,41 @@ function(add_compiler_rt_runtime name type)
       if(WIN32 AND NOT CYGWIN AND NOT MINGW)
         set_target_properties(${libname} PROPERTIES IMPORT_PREFIX "")
         set_target_properties(${libname} PROPERTIES IMPORT_SUFFIX ".lib")
+        if (LLVM_ENABLE_PDB)
+          install(FILES $<TARGET_PDB_FILE:${libname}> DESTINATION "${install_dir_${libname}}" COMPONENT ${COMPONENT_OPTION} OPTIONAL)
+        endif()
       endif()
-      if (APPLE AND NOT CMAKE_LINKER MATCHES ".*lld.*")
-        # Ad-hoc sign the dylibs when using Xcode versions older than 12.
-        # Xcode 12 shipped with ld64-609.
-        # FIXME: Remove whole conditional block once everything uses Xcode 12+.
-        set(LD_V_OUTPUT)
+      find_program(CODESIGN codesign)
+      if (APPLE AND NOT CMAKE_LINKER MATCHES ".*lld.*" AND CODESIGN)
+        # Apple's linker signs the resulting dylib with an ad-hoc code signature in
+        # most situations, except:
+        # 1. Versions of ld64 prior to ld64-609 in Xcode 12 predate this behavior.
+        # 2. Apple's new linker does not when building with `-darwin-target-variant`
+        #    to support macOS Catalyst.
+        #
+        # Explicitly re-signing the dylib works around both of these issues. The
+        # signature is marked as `linker-signed` when that is supported so that it
+        # behaves as expected when processed by subsequent tooling.
+        #
+        # Detect whether `codesign` supports `-o linker-signed` by passing it as an
+        # argument and looking for `invalid argument "linker-signed"` in its output.
+        # FIXME: Remove this once all supported toolchains support `-o linker-signed`.
         execute_process(
-          COMMAND sh -c "${CMAKE_LINKER} -v 2>&1 | head -1"
-          RESULT_VARIABLE HAD_ERROR
-          OUTPUT_VARIABLE LD_V_OUTPUT
+          COMMAND sh -c "${CODESIGN} -f -s - -o linker-signed this-does-not-exist 2>&1 | grep -q linker-signed"
+          RESULT_VARIABLE CODESIGN_SUPPORTS_LINKER_SIGNED
         )
-        if (HAD_ERROR)
-          message(FATAL_ERROR "${CMAKE_LINKER} failed with status ${HAD_ERROR}")
+
+        set(EXTRA_CODESIGN_ARGUMENTS)
+        if (CODESIGN_SUPPORTS_LINKER_SIGNED)
+          list(APPEND EXTRA_CODESIGN_ARGUMENTS -o linker-signed)
         endif()
-        set(NEED_EXPLICIT_ADHOC_CODESIGN 0)
-        # Apple introduced a new linker by default in Xcode 15. This linker reports itself as ld
-        # rather than ld64 and does not match this version regex. That's ok since it never needs
-        # the explicit ad-hoc code signature.
-        if ("${LD_V_OUTPUT}" MATCHES ".*ld64-([0-9.]+).*")
-          string(REGEX REPLACE ".*ld64-([0-9.]+).*" "\\1" HOST_LINK_VERSION ${LD_V_OUTPUT})
-          if (HOST_LINK_VERSION VERSION_LESS 609)
-            set(NEED_EXPLICIT_ADHOC_CODESIGN 1)
-          endif()
-        endif()
-        if (NEED_EXPLICIT_ADHOC_CODESIGN)
-          add_custom_command(TARGET ${libname}
-            POST_BUILD
-            COMMAND codesign --sign - $<TARGET_FILE:${libname}>
-            WORKING_DIRECTORY ${COMPILER_RT_OUTPUT_LIBRARY_DIR}
-          )
-        endif()
+
+        add_custom_command(TARGET ${libname}
+          POST_BUILD
+          COMMAND ${CODESIGN} --sign - ${EXTRA_CODESIGN_ARGUMENTS} $<TARGET_FILE:${libname}>
+          WORKING_DIRECTORY ${COMPILER_RT_OUTPUT_LIBRARY_DIR}
+          COMMAND_EXPAND_LISTS
+        )
       endif()
     endif()
 
@@ -517,7 +585,7 @@ function(add_compiler_rt_test test_suite test_name arch)
   # when linking, not the compiler. Here, we hack it to use the compiler
   # because we want to use -fsanitize flags.
 
-  # Only add CMAKE_EXE_LINKER_FLAGS when in a standalone bulid.
+  # Only add CMAKE_EXE_LINKER_FLAGS when in a standalone build.
   # Or else CMAKE_EXE_LINKER_FLAGS contains flags for build compiler of Clang/llvm.
   # This might not be the same as what the COMPILER_RT_TEST_COMPILER supports.
   # eg: the build compiler use lld linker and we build clang with default ld linker
@@ -538,28 +606,11 @@ function(add_compiler_rt_test test_suite test_name arch)
     DEPENDS ${TEST_DEPS}
     )
   add_custom_target(T${test_name} DEPENDS "${output_bin}")
-  set_target_properties(T${test_name} PROPERTIES FOLDER "Compiler-RT Tests")
+  set_target_properties(T${test_name} PROPERTIES FOLDER "compiler-rt/Tests")
 
   # Make the test suite depend on the binary.
   add_dependencies(${test_suite} T${test_name})
 endfunction()
-
-macro(add_compiler_rt_resource_file target_name file_name component)
-  set(src_file "${CMAKE_CURRENT_SOURCE_DIR}/${file_name}")
-  set(dst_file "${COMPILER_RT_OUTPUT_DIR}/share/${file_name}")
-  add_custom_command(OUTPUT ${dst_file}
-    DEPENDS ${src_file}
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${src_file} ${dst_file}
-    COMMENT "Copying ${file_name}...")
-  add_custom_target(${target_name} DEPENDS ${dst_file})
-  # Install in Clang resource directory.
-  install(FILES ${file_name}
-    DESTINATION ${COMPILER_RT_INSTALL_DATA_DIR}
-    COMPONENT ${component})
-  add_dependencies(${component} ${target_name})
-
-  set_target_properties(${target_name} PROPERTIES FOLDER "Compiler-RT Misc")
-endmacro()
 
 macro(add_compiler_rt_script name)
   set(dst ${COMPILER_RT_EXEC_OUTPUT_DIR}/${name})
@@ -573,6 +624,24 @@ macro(add_compiler_rt_script name)
     PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE
     DESTINATION ${COMPILER_RT_INSTALL_BINARY_DIR})
 endmacro(add_compiler_rt_script src name)
+
+
+macro(add_compiler_rt_cfg target_name file_name component arch)
+  set(src_file "${CMAKE_CURRENT_SOURCE_DIR}/AIX/${file_name}")
+  get_compiler_rt_output_dir(${arch} output_dir)
+  set(dst_file "${output_dir}/${file_name}")
+  add_custom_command(OUTPUT ${dst_file}
+    DEPENDS ${src_file}
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${src_file} ${dst_file}
+    COMMENT "Copying ${file_name}...")
+  add_custom_target(${target_name} DEPENDS ${dst_file})
+  install(FILES ${file_name}
+    DESTINATION ${COMPILER_RT_INSTALL_LIBRARY_DIR}
+    COMPONENT ${component})
+  add_dependencies(${component} ${target_name})
+
+  set_target_properties(${target_name} PROPERTIES FOLDER "compiler-rt Misc")
+endmacro()
 
 # Builds custom version of libc++ and installs it in <prefix>.
 # Can be used to build sanitized versions of libc++ for running unit tests.
@@ -607,7 +676,7 @@ macro(add_custom_libcxx name prefix)
     COMMENT "Clobbering ${name} build directories"
     USES_TERMINAL
     )
-  set_target_properties(${name}-clear PROPERTIES FOLDER "Compiler-RT Misc")
+  set_target_properties(${name}-clear PROPERTIES FOLDER "compiler-rt/Metatargets")
 
   add_custom_command(
     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${name}-clobber-stamp
@@ -619,7 +688,7 @@ macro(add_custom_libcxx name prefix)
 
   add_custom_target(${name}-clobber
     DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/${name}-clobber-stamp)
-  set_target_properties(${name}-clobber PROPERTIES FOLDER "Compiler-RT Misc")
+  set_target_properties(${name}-clobber PROPERTIES FOLDER "compiler-rt/Metatargets")
 
   set(PASSTHROUGH_VARIABLES
     ANDROID
@@ -640,6 +709,7 @@ macro(add_custom_libcxx name prefix)
     CMAKE_STRIP
     CMAKE_READELF
     CMAKE_SYSROOT
+    CMAKE_INSTALL_MESSAGE
     CMAKE_TOOLCHAIN_FILE
     LIBCXX_HAS_MUSL_LIBC
     LIBCXX_HAS_GCC_S_LIB
@@ -673,17 +743,18 @@ macro(add_custom_libcxx name prefix)
 
   ExternalProject_Add(${name}
     DEPENDS ${name}-clobber ${LIBCXX_DEPS}
-    PREFIX ${CMAKE_CURRENT_BINARY_DIR}/${name}
+    PREFIX ${prefix}
     SOURCE_DIR ${LLVM_MAIN_SRC_DIR}/../runtimes
-    BINARY_DIR ${prefix}
-    CMAKE_ARGS ${CMAKE_PASSTHROUGH_VARIABLES}
+    BINARY_DIR ${prefix}/build
+    CMAKE_ARGS -DCMAKE_INSTALL_MESSAGE=NEVER
+               ${CMAKE_PASSTHROUGH_VARIABLES}
                ${compiler_args}
                ${verbose}
                -DCMAKE_C_FLAGS=${LIBCXX_C_FLAGS}
                -DCMAKE_CXX_FLAGS=${LIBCXX_CXX_FLAGS}
                -DCMAKE_BUILD_TYPE=Release
+               -DCMAKE_INSTALL_PREFIX=<INSTALL_DIR>
                -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY
-               -DLLVM_PATH=${LLVM_MAIN_SRC_DIR}
                -DLLVM_ENABLE_RUNTIMES=libcxx|libcxxabi
                -DLIBCXXABI_USE_LLVM_UNWINDER=OFF
                -DLIBCXXABI_ENABLE_SHARED=OFF
@@ -695,8 +766,9 @@ macro(add_custom_libcxx name prefix)
                -DLIBCXX_INCLUDE_BENCHMARKS=OFF
                -DLIBCXX_INCLUDE_TESTS=OFF
                -DLIBCXX_ENABLE_STATIC_ABI_LIBRARY=ON
+               -DLLVM_INCLUDE_TESTS=OFF
+               -DLLVM_INCLUDE_DOCS=OFF
                ${LIBCXX_CMAKE_ARGS}
-    INSTALL_COMMAND ""
     STEP_TARGETS configure build
     BUILD_ALWAYS 1
     USES_TERMINAL_CONFIGURE 1
@@ -704,8 +776,23 @@ macro(add_custom_libcxx name prefix)
     USES_TERMINAL_INSTALL 1
     LIST_SEPARATOR |
     EXCLUDE_FROM_ALL TRUE
-    BUILD_BYPRODUCTS "${prefix}/lib/libc++.a" "${prefix}/lib/libc++abi.a"
     )
+
+  # Once we depend on CMake 3.26, we can use the INSTALL_BYPRODUCTS argument
+  # instead of having to fall back to ExternalProject_Add_Step()
+  # Note: We can't use the normal name "install" here since that interferes
+  # with the default ExternalProject_Add() logic and causes errors.
+  ExternalProject_Add_Step(${name} install-cmake326-workaround
+    # Ensure that DESTDIR=... set in the out environment does not affect this
+    # target (we always need to install to the build directory).
+    COMMAND env DESTDIR= ${CMAKE_COMMAND} --build ${prefix}/build --target install
+    COMMENT "Installing ${name}..."
+    BYPRODUCTS "${prefix}/lib/libc++.a" "${prefix}/lib/libc++abi.a"
+    DEPENDEES build
+    EXCLUDE_FROM_MAIN 1
+    USES_TERMINAL 1
+  )
+  ExternalProject_Add_StepTargets(${name} install-cmake326-workaround)
 
   if (CMAKE_GENERATOR MATCHES "Make")
     set(run_clean "$(MAKE)" "-C" "${prefix}" "clean")
@@ -758,6 +845,19 @@ function(rt_externalize_debuginfo name)
 endfunction()
 
 
+# Wire a sanitizer runtime target up to the sanitizer-ignorelists target so
+# that building/installing the runtime also builds/installs the ignorelists.
+macro(add_sanitizer_ignorelists_dependency name)
+  add_dependencies(${name} sanitizer-ignorelists)
+  if(TARGET install-${name})
+    add_dependencies(install-${name} install-sanitizer-ignorelists)
+  endif()
+  if(TARGET install-${name}-stripped)
+    add_dependencies(install-${name}-stripped install-sanitizer-ignorelists)
+  endif()
+endmacro()
+
+
 # Configure lit configuration files, including compiler-rt specific variables.
 function(configure_compiler_rt_lit_site_cfg input output)
   set_llvm_build_mode()
@@ -766,6 +866,7 @@ function(configure_compiler_rt_lit_site_cfg input output)
 
   string(REPLACE ${CMAKE_CFG_INTDIR} ${LLVM_BUILD_MODE} COMPILER_RT_RESOLVED_TEST_COMPILER ${COMPILER_RT_TEST_COMPILER})
   string(REPLACE ${CMAKE_CFG_INTDIR} ${LLVM_BUILD_MODE} COMPILER_RT_RESOLVED_OUTPUT_DIR ${COMPILER_RT_OUTPUT_DIR})
+  string(REPLACE ${CMAKE_CFG_INTDIR} ${LLVM_BUILD_MODE} COMPILER_RT_RESOLVED_EXEC_OUTPUT_DIR ${COMPILER_RT_EXEC_OUTPUT_DIR})
   string(REPLACE ${CMAKE_CFG_INTDIR} ${LLVM_BUILD_MODE} COMPILER_RT_RESOLVED_LIBRARY_OUTPUT_DIR ${output_dir})
 
   configure_lit_site_cfg(${input} ${output})

@@ -1,4 +1,4 @@
-﻿"""
+"""
 Test calling a function that hits a signal set to auto-restart, make sure the call completes.
 """
 
@@ -9,6 +9,7 @@ from lldbsuite.test.lldbtest import *
 from lldbsuite.test import lldbutil
 
 
+@requireSignals
 class ExprCommandThatRestartsTestCase(TestBase):
     NO_DEBUG_INFO_TESTCASE = True
 
@@ -20,7 +21,7 @@ class ExprCommandThatRestartsTestCase(TestBase):
         self.main_source_spec = lldb.SBFileSpec(self.main_source)
 
     @skipIfDarwin  # llvm.org/pr19246: intermittent failure
-    @skipIfWindows  # Test relies on signals, unsupported on Windows
+    @requireNotWindows("Test relies on signals, unsupported on Windows")
     @expectedFlakeyAndroid(bugnumber="llvm.org/pr19246")
     @expectedFlakeyNetBSD
     def test(self):

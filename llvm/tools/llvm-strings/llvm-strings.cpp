@@ -38,12 +38,13 @@ enum ID {
 #undef OPTION
 };
 
-#define PREFIX(NAME, VALUE)                                                    \
-  static constexpr StringLiteral NAME##_init[] = VALUE;                        \
-  static constexpr ArrayRef<StringLiteral> NAME(NAME##_init,                   \
-                                                std::size(NAME##_init) - 1);
+#define OPTTABLE_STR_TABLE_CODE
 #include "Opts.inc"
-#undef PREFIX
+#undef OPTTABLE_STR_TABLE_CODE
+
+#define OPTTABLE_PREFIXES_TABLE_CODE
+#include "Opts.inc"
+#undef OPTTABLE_PREFIXES_TABLE_CODE
 
 using namespace llvm::opt;
 static constexpr opt::OptTable::Info InfoTable[] = {
@@ -54,12 +55,12 @@ static constexpr opt::OptTable::Info InfoTable[] = {
 
 class StringsOptTable : public opt::GenericOptTable {
 public:
-  StringsOptTable() : GenericOptTable(InfoTable) {
+  StringsOptTable()
+      : GenericOptTable(OptionStrTable, OptionPrefixesTable, InfoTable) {
     setGroupedShortOptions(true);
     setDashDashParsing(true);
   }
 };
-} // namespace
 
 static StringRef ToolName;
 
@@ -69,8 +70,9 @@ static cl::list<std::string> InputFileNames(cl::Positional,
 static int MinLength = 4;
 static bool PrintFileName;
 
-enum radix { none, octal, hexadecimal, decimal };
-static radix Radix;
+enum class Radix { None, Octal, Hexadecimal, Decimal };
+static Radix Radix;
+} // namespace
 
 [[noreturn]] static void reportCmdLineError(const Twine &Message) {
   WithColor::error(errs(), ToolName) << Message << "\n";
@@ -87,21 +89,21 @@ static void parseIntArg(const opt::InputArgList &Args, int ID, T &Value) {
 }
 
 static void strings(raw_ostream &OS, StringRef FileName, StringRef Contents) {
-  auto print = [&OS, FileName](unsigned Offset, StringRef L) {
+  auto Print = [&OS, FileName](unsigned Offset, StringRef L) {
     if (L.size() < static_cast<size_t>(MinLength))
       return;
     if (PrintFileName)
       OS << FileName << ": ";
     switch (Radix) {
-    case none:
+    case Radix::None:
       break;
-    case octal:
+    case Radix::Octal:
       OS << format("%7o ", Offset);
       break;
-    case hexadecimal:
+    case Radix::Hexadecimal:
       OS << format("%7x ", Offset);
       break;
-    case decimal:
+    case Radix::Decimal:
       OS << format("%7u ", Offset);
       break;
     }
@@ -115,12 +117,12 @@ static void strings(raw_ostream &OS, StringRef FileName, StringRef Contents) {
       if (S == nullptr)
         S = P;
     } else if (S) {
-      print(S - B, StringRef(S, P - S));
+      Print(S - B, StringRef(S, P - S));
       S = nullptr;
     }
   }
   if (S)
-    print(S - B, StringRef(S, E - S));
+    Print(S - B, StringRef(S, E - S));
 }
 
 int main(int argc, char **argv) {
@@ -149,18 +151,20 @@ int main(int argc, char **argv) {
 
   parseIntArg(Args, OPT_bytes_EQ, MinLength);
   PrintFileName = Args.hasArg(OPT_print_file_name);
-  StringRef R = Args.getLastArgValue(OPT_radix_EQ);
-  if (R.empty())
-    Radix = none;
-  else if (R == "o")
-    Radix = octal;
-  else if (R == "d")
-    Radix = decimal;
-  else if (R == "x")
-    Radix = hexadecimal;
-  else
-    reportCmdLineError("--radix value should be one of: '' (no offset), 'o' "
-                       "(octal), 'd' (decimal), 'x' (hexadecimal)");
+  Arg *RadixArg = Args.getLastArg(OPT_radix_EQ);
+  if (!RadixArg) {
+    Radix = Radix::None;
+  } else {
+    Radix = llvm::StringSwitch<enum Radix>(RadixArg->getValue())
+                .Case("o", Radix::Octal)
+                .Case("d", Radix::Decimal)
+                .Case("x", Radix::Hexadecimal)
+                .Default(Radix::None);
+    if (Radix == Radix::None)
+      reportCmdLineError("'" + StringRef(RadixArg->getValue()) +
+                         "' is not a valid value for '" +
+                         RadixArg->getSpelling() + "'");
+  }
 
   if (MinLength == 0) {
     errs() << "invalid minimum string length 0\n";
@@ -173,7 +177,7 @@ int main(int argc, char **argv) {
 
   for (const auto &File : InputFileNames) {
     ErrorOr<std::unique_ptr<MemoryBuffer>> Buffer =
-        MemoryBuffer::getFileOrSTDIN(File);
+        MemoryBuffer::getFileOrSTDIN(File, /*IsText=*/true);
     if (std::error_code EC = Buffer.getError())
       errs() << File << ": " << EC.message() << '\n';
     else

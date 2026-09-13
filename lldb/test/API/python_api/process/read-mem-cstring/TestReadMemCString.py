@@ -11,6 +11,9 @@ from lldbsuite.test import lldbutil
 class TestReadMemCString(TestBase):
     NO_DEBUG_INFO_TESTCASE = True
 
+    @requireNotWasm(
+        "linear memory has no unmapped pages, so a bad in-range pointer still reads"
+    )
     def test_read_memory_c_string(self):
         """Test corner case behavior of SBProcess::ReadCStringFromMemory"""
         self.build()
@@ -61,4 +64,4 @@ class TestReadMemCString(TestBase):
             invalid_memory_str_addr, 2048, err
         )
         self.assertTrue(err.Fail())
-        self.assertTrue(invalid_memory_string == "" or invalid_memory_string == None)
+        self.assertTrue(invalid_memory_string == "" or invalid_memory_string is None)

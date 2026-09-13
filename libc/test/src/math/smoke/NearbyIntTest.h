@@ -15,8 +15,7 @@
 #include "test/UnitTest/FPMatcher.h"
 #include "test/UnitTest/Test.h"
 
-static constexpr int ROUNDING_MODES[4] = {FE_UPWARD, FE_DOWNWARD, FE_TOWARDZERO,
-                                          FE_TONEAREST};
+using LIBC_NAMESPACE::Sign;
 
 template <typename T>
 class NearbyIntTestTemplate : public LIBC_NAMESPACE::testing::Test {

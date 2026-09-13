@@ -13,47 +13,24 @@
 #ifndef LLVM_FRONTEND_HLSL_HLSLRESOURCE_H
 #define LLVM_FRONTEND_HLSL_HLSLRESOURCE_H
 
-#include "llvm/IR/Metadata.h"
 #include "llvm/Support/DXILABI.h"
 
 namespace llvm {
-class GlobalVariable;
+class Type;
 
 namespace hlsl {
 
-enum class ResourceClass : uint8_t {
-  SRV = 0,
-  UAV,
-  CBuffer,
-  Sampler,
-  Invalid,
-  NumClasses = Invalid,
-};
-
 // For now we use DXIL ABI enum values directly. This may change in the future.
-using dxil::ElementType;
-using dxil::ResourceKind;
+using dxil::ResourceClass;
+using dxil::ResourceDimension;
 
-class FrontendResource {
-  MDNode *Entry;
+const unsigned CBufferRowSizeInBytes = 16U;
 
-public:
-  FrontendResource(MDNode *E) : Entry(E) {
-    assert(Entry->getNumOperands() == 6 && "Unexpected metadata shape");
-  }
+/// Converts a scalar or vector LLVM type to its DXIL element type. Integer
+/// signedness must be supplied separately because LLVM integer types are
+/// signless.
+LLVM_ABI dxil::ElementType getDXILElementType(Type *Ty, bool IsSigned);
 
-  FrontendResource(GlobalVariable *GV, ResourceKind RK, ElementType ElTy,
-                   bool IsROV, uint32_t ResIndex, uint32_t Space);
-
-  GlobalVariable *getGlobalVariable();
-  StringRef getSourceType();
-  ResourceKind getResourceKind();
-  ElementType getElementType();
-  bool getIsROV();
-  uint32_t getResourceIndex();
-  uint32_t getSpace();
-  MDNode *getMetadata() { return Entry; }
-};
 } // namespace hlsl
 } // namespace llvm
 

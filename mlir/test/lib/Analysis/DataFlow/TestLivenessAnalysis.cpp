@@ -18,7 +18,6 @@
 #include <mlir/Pass/Pass.h>
 #include <mlir/Pass/PassRegistry.h>
 #include <mlir/Support/LLVM.h>
-#include <mlir/Support/LogicalResult.h>
 #include <mlir/Support/TypeID.h>
 
 using namespace mlir;
@@ -34,13 +33,12 @@ struct TestLivenessAnalysisPass
 
   void runOnOperation() override {
     auto &livenessAnalysis = getAnalysis<RunLivenessAnalysis>();
-
     Operation *op = getOperation();
 
     raw_ostream &os = llvm::outs();
 
     op->walk([&](Operation *op) {
-      auto tag = op->getAttrOfType<StringAttr>("tag");
+      auto tag = op->getDiscardableAttrOfType<StringAttr>("tag");
       if (!tag)
         return;
       os << "test_tag: " << tag.getValue() << ":\n";
@@ -57,6 +55,20 @@ struct TestLivenessAnalysisPass
         os << " result #" << index << ": ";
         liveness->print(os);
         os << "\n";
+      }
+      for (auto [regionIndex, region] : llvm::enumerate(op->getRegions())) {
+        os << " region: #" << regionIndex << ":\n";
+        for (auto [blockIndex, block] : llvm::enumerate(region)) {
+          os << "    block: #" << blockIndex << ":\n";
+          for (auto [argumentIndex, argument] :
+               llvm::enumerate(block.getArguments())) {
+            const Liveness *liveness = livenessAnalysis.getLiveness(argument);
+            assert(liveness && "expected a sparse lattice");
+            os << "     argument: #" << argumentIndex << ": ";
+            liveness->print(os);
+            os << "\n";
+          }
+        }
       }
     });
   }

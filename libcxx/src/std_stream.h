@@ -11,7 +11,8 @@
 #define _LIBCPP_STD_STREAM_H
 
 #include <__config>
-#include <__locale>
+#include <__locale_dir/codecvt.h>
+#include <__locale_dir/locale.h>
 #include <cstdio>
 #include <istream>
 #include <ostream>
@@ -24,6 +25,7 @@ _LIBCPP_PUSH_MACROS
 #include <__undef_macros>
 
 _LIBCPP_BEGIN_NAMESPACE_STD
+_LIBCPP_BEGIN_EXPLICIT_ABI_ANNOTATIONS
 
 static const int __limit = 8;
 
@@ -56,7 +58,7 @@ private:
   bool __last_consumed_is_next_;
   bool __always_noconv_;
 
-#if defined(_LIBCPP_WIN32API)
+#ifdef _WIN32
   static constexpr bool __is_win32api_wide_char = !is_same_v<_CharT, char>;
 #else
   static constexpr bool __is_win32api_wide_char = false;
@@ -86,7 +88,7 @@ void __stdinbuf<_CharT>::imbue(const locale& __loc) {
   __encoding_      = __cv_->encoding();
   __always_noconv_ = __cv_->always_noconv();
   if (__encoding_ > __limit)
-    __throw_runtime_error("unsupported locale for standard input");
+    std::__throw_runtime_error("unsupported locale for standard input");
 }
 
 template <class _CharT>
@@ -106,7 +108,7 @@ inline bool __do_getc(FILE* __fp, char* __pbuf) {
   *__pbuf = static_cast<char>(__c);
   return true;
 }
-#ifndef _LIBCPP_HAS_NO_WIDE_CHARACTERS
+#if _LIBCPP_HAS_WIDE_CHARACTERS
 inline bool __do_getc(FILE* __fp, wchar_t* __pbuf) {
   wint_t __c = getwc(__fp);
   if (__c == WEOF)
@@ -121,7 +123,7 @@ inline bool __do_ungetc(int __c, FILE* __fp, char __dummy) {
     return false;
   return true;
 }
-#ifndef _LIBCPP_HAS_NO_WIDE_CHARACTERS
+#if _LIBCPP_HAS_WIDE_CHARACTERS
 inline bool __do_ungetc(std::wint_t __c, FILE* __fp, wchar_t __dummy) {
   if (ungetwc(__c, __fp) == WEOF)
     return false;
@@ -261,7 +263,7 @@ private:
   state_type* __st_;
   bool __always_noconv_;
 
-#if defined(_LIBCPP_WIN32API)
+#ifdef _WIN32
   static constexpr bool __is_win32api_wide_char = !is_same_v<_CharT, char>;
 #else
   static constexpr bool __is_win32api_wide_char = false;
@@ -293,7 +295,7 @@ inline bool __do_fputc(char __c, FILE* __fp) {
     return false;
   return true;
 }
-#ifndef _LIBCPP_HAS_NO_WIDE_CHARACTERS
+#if _LIBCPP_HAS_WIDE_CHARACTERS
 inline bool __do_fputc(wchar_t __c, FILE* __fp) {
   // fputwc works regardless of wide/narrow mode of stdout, while
   // fwrite of wchar_t only works if the stream actually has been set
@@ -380,6 +382,7 @@ void __stdoutbuf<_CharT>::imbue(const locale& __loc) {
   __always_noconv_ = __cv_->always_noconv();
 }
 
+_LIBCPP_END_EXPLICIT_ABI_ANNOTATIONS
 _LIBCPP_END_NAMESPACE_STD
 
 _LIBCPP_POP_MACROS

@@ -54,6 +54,8 @@ using namespace llvm;
 STATISTIC(NumOfPGOMemOPOpt, "Number of memop intrinsics optimized.");
 STATISTIC(NumOfPGOMemOPAnnotate, "Number of memop intrinsics annotated.");
 
+namespace llvm {
+
 // The minimum call count to optimize memory intrinsic calls.
 static cl::opt<unsigned>
     MemOPCountThreshold("pgo-memop-count-threshold", cl::Hidden, cl::init(1000),
@@ -92,6 +94,8 @@ cl::opt<bool>
 static cl::opt<unsigned>
     MemOpMaxOptSize("memop-value-prof-max-opt-size", cl::Hidden, cl::init(128),
                     cl::desc("Optimize the memop size <= this value"));
+
+} // end namespace llvm
 
 namespace {
 
@@ -142,31 +146,19 @@ struct MemOp {
     return false;
   }
   bool isMemcmp(TargetLibraryInfo &TLI) {
-    LibFunc Func;
-    if (asMI() == nullptr && TLI.getLibFunc(*asCI(), Func) &&
-        Func == LibFunc_memcmp) {
-      return true;
-    }
-    return false;
+    return asMI() == nullptr && TLI.getLibFunc(*asCI()) == LibFunc_memcmp;
   }
   bool isBcmp(TargetLibraryInfo &TLI) {
-    LibFunc Func;
-    if (asMI() == nullptr && TLI.getLibFunc(*asCI(), Func) &&
-        Func == LibFunc_bcmp) {
-      return true;
-    }
-    return false;
+    return asMI() == nullptr && TLI.getLibFunc(*asCI()) == LibFunc_bcmp;
   }
   const char *getName(TargetLibraryInfo &TLI) {
     if (auto MI = asMI())
       return getMIName(MI);
-    LibFunc Func;
-    if (TLI.getLibFunc(*asCI(), Func)) {
-      if (Func == LibFunc_memcmp)
-        return "memcmp";
-      if (Func == LibFunc_bcmp)
-        return "bcmp";
-    }
+    LibFunc Func = TLI.getLibFunc(*asCI());
+    if (Func == LibFunc_memcmp)
+      return "memcmp";
+    if (Func == LibFunc_bcmp)
+      return "bcmp";
     llvm_unreachable("Must be MemIntrinsic or memcmp/bcmp CallInst");
     return nullptr;
   }
@@ -177,10 +169,7 @@ public:
   MemOPSizeOpt(Function &Func, BlockFrequencyInfo &BFI,
                OptimizationRemarkEmitter &ORE, DominatorTree *DT,
                TargetLibraryInfo &TLI)
-      : Func(Func), BFI(BFI), ORE(ORE), DT(DT), TLI(TLI), Changed(false) {
-    ValueDataArray =
-        std::make_unique<InstrProfValueData[]>(INSTR_PROF_NUM_BUCKETS);
-  }
+      : Func(Func), BFI(BFI), ORE(ORE), DT(DT), TLI(TLI), Changed(false) {}
   bool isChanged() const { return Changed; }
   void perform() {
     WorkList.clear();
@@ -206,9 +195,8 @@ public:
   }
 
   void visitCallInst(CallInst &CI) {
-    LibFunc Func;
-    if (TLI.getLibFunc(CI, Func) &&
-        (Func == LibFunc_memcmp || Func == LibFunc_bcmp) &&
+    LibFunc Func = TLI.getLibFunc(CI);
+    if ((Func == LibFunc_memcmp || Func == LibFunc_bcmp) &&
         !isa<ConstantInt>(CI.getArgOperand(2))) {
       WorkList.push_back(MemOp(&CI));
     }
@@ -222,8 +210,6 @@ private:
   TargetLibraryInfo &TLI;
   bool Changed;
   std::vector<MemOp> WorkList;
-  // The space to read the profile annotation.
-  std::unique_ptr<InstrProfValueData[]> ValueDataArray;
   bool perform(MemOp MO);
 };
 
@@ -252,10 +238,11 @@ bool MemOPSizeOpt::perform(MemOp MO) {
   if (!MemOPOptMemcmpBcmp && (MO.isMemcmp(TLI) || MO.isBcmp(TLI)))
     return false;
 
-  uint32_t NumVals, MaxNumVals = INSTR_PROF_NUM_BUCKETS;
+  uint32_t MaxNumVals = INSTR_PROF_NUM_BUCKETS;
   uint64_t TotalCount;
-  if (!getValueProfDataFromInst(*MO.I, IPVK_MemOPSize, MaxNumVals,
-                                ValueDataArray.get(), NumVals, TotalCount))
+  auto VDs =
+      getValueProfDataFromInst(*MO.I, IPVK_MemOPSize, MaxNumVals, TotalCount);
+  if (VDs.empty())
     return false;
 
   uint64_t ActualCount = TotalCount;
@@ -267,7 +254,6 @@ bool MemOPSizeOpt::perform(MemOp MO) {
     ActualCount = *BBEdgeCount;
   }
 
-  ArrayRef<InstrProfValueData> VDs(ValueDataArray.get(), NumVals);
   LLVM_DEBUG(dbgs() << "Read one memory intrinsic profile with count "
                     << ActualCount << "\n");
   LLVM_DEBUG(
@@ -291,7 +277,6 @@ bool MemOPSizeOpt::perform(MemOp MO) {
   uint64_t SavedRemainCount = SavedTotalCount;
   SmallVector<uint64_t, 16> SizeIds;
   SmallVector<uint64_t, 16> CaseCounts;
-  SmallDenseSet<uint64_t, 16> SeenSizeId;
   uint64_t MaxCount = 0;
   unsigned Version = 0;
   // Default case is in the front -- save the slot here.
@@ -314,12 +299,6 @@ bool MemOPSizeOpt::perform(MemOp MO) {
     if (!isProfitable(C, RemainCount)) {
       RemainingVDs.insert(RemainingVDs.end(), I, E);
       break;
-    }
-
-    if (!SeenSizeId.insert(V).second) {
-      errs() << "warning: Invalid Profile Data in Function " << Func.getName()
-             << ": Two identical values in MemOp value counts.\n";
-      return false;
     }
 
     SizeIds.push_back(V);
@@ -391,7 +370,7 @@ bool MemOPSizeOpt::perform(MemOp MO) {
   PHINode *PHI = nullptr;
   if (!MemOpTy->isVoidTy()) {
     // Insert a phi for the return values at the merge block.
-    IRBuilder<> IRBM(MergeBB->getFirstNonPHI());
+    IRBuilder<> IRBM(MergeBB, MergeBB->getFirstNonPHIIt());
     PHI = IRBM.CreatePHI(MemOpTy, SizeIds.size() + 1, "MemOP.RVMerge");
     MO.I->replaceAllUsesWith(PHI);
     PHI->addIncoming(MO.I, DefaultBB);
@@ -400,11 +379,10 @@ bool MemOPSizeOpt::perform(MemOp MO) {
   // Clear the value profile data.
   MO.I->setMetadata(LLVMContext::MD_prof, nullptr);
   // If all promoted, we don't need the MD.prof metadata.
-  if (SavedRemainCount > 0 || Version != NumVals) {
+  if (SavedRemainCount > 0 || Version != VDs.size()) {
     // Otherwise we need update with the un-promoted records back.
-    ArrayRef<InstrProfValueData> RemVDs(RemainingVDs);
-    annotateValueSite(*Func.getParent(), *MO.I, RemVDs, SavedRemainCount,
-                      IPVK_MemOPSize, NumVals);
+    annotateValueSite(*Func.getParent(), *MO.I, RemainingVDs, SavedRemainCount,
+                      IPVK_MemOPSize, VDs.size());
   }
 
   LLVM_DEBUG(dbgs() << "\n\n== Basic Block After==\n");
@@ -438,7 +416,7 @@ bool MemOPSizeOpt::perform(MemOp MO) {
   Updates.clear();
 
   if (MaxCount)
-    setProfMetadata(Func.getParent(), SI, CaseCounts, MaxCount);
+    setProfMetadata(SI, CaseCounts, MaxCount);
 
   LLVM_DEBUG(dbgs() << *BB << "\n");
   LLVM_DEBUG(dbgs() << *DefaultBB << "\n");
@@ -462,7 +440,7 @@ static bool PGOMemOPSizeOptImpl(Function &F, BlockFrequencyInfo &BFI,
   if (DisableMemOPOPT)
     return false;
 
-  if (F.hasFnAttribute(Attribute::OptimizeForSize))
+  if (F.hasOptSize())
     return false;
   MemOPSizeOpt MemOPSizeOpt(F, BFI, ORE, DT, TLI);
   MemOPSizeOpt.perform();

@@ -54,10 +54,6 @@ namespace clang {
 namespace clangd {
 namespace {
 
-MATCHER_P2(Distance, File, D, "") {
-  return arg.first() == File && arg.second == D;
-}
-
 // Builds a preamble for BaselineContents, patches it for ModifiedContents and
 // returns the includes in the patch.
 IncludeStructure
@@ -169,13 +165,6 @@ TEST(PreamblePatchTest, ContainsNewIncludes) {
                       .MainFileIncludes;
   EXPECT_THAT(Includes, ElementsAre(AllOf(Field(&Inclusion::Written, "<d.h>"),
                                           Field(&Inclusion::HashLine, 4))));
-}
-
-TEST(PreamblePatchTest, MainFileIsEscaped) {
-  auto Includes = collectPatchedIncludes("#include <a.h>", "", "file\"name.cpp")
-                      .MainFileIncludes;
-  EXPECT_THAT(Includes, ElementsAre(AllOf(Field(&Inclusion::Written, "<a.h>"),
-                                          Field(&Inclusion::HashLine, 0))));
 }
 
 TEST(PreamblePatchTest, PatchesPreambleIncludes) {
@@ -417,7 +406,7 @@ TEST(PreamblePatchTest, LocateMacroAtWorks) {
     ASSERT_TRUE(AST);
 
     const auto &SM = AST->getSourceManager();
-    auto *MacroTok = AST->getTokens().spelledTokenAt(
+    auto *MacroTok = AST->getTokens().spelledTokenContaining(
         SM.getComposedLoc(SM.getMainFileID(), Modified.point("use")));
     ASSERT_TRUE(MacroTok);
 
@@ -441,7 +430,7 @@ TEST(PreamblePatchTest, LocateMacroAtDeletion) {
     ASSERT_TRUE(AST);
 
     const auto &SM = AST->getSourceManager();
-    auto *MacroTok = AST->getTokens().spelledTokenAt(
+    auto *MacroTok = AST->getTokens().spelledTokenContaining(
         SM.getComposedLoc(SM.getMainFileID(), Modified.point()));
     ASSERT_TRUE(MacroTok);
 
@@ -512,9 +501,10 @@ TEST(PreamblePatchTest, RefsToMacros) {
       ExpectedLocations.push_back(referenceRangeIs(R));
 
     for (const auto &P : Modified.points()) {
-      auto *MacroTok = AST->getTokens().spelledTokenAt(SM.getComposedLoc(
-          SM.getMainFileID(),
-          llvm::cantFail(positionToOffset(Modified.code(), P))));
+      auto *MacroTok =
+          AST->getTokens().spelledTokenContaining(SM.getComposedLoc(
+              SM.getMainFileID(),
+              llvm::cantFail(positionToOffset(Modified.code(), P))));
       ASSERT_TRUE(MacroTok);
       EXPECT_THAT(findReferences(*AST, P, 0).References,
                   testing::ElementsAreArray(ExpectedLocations));

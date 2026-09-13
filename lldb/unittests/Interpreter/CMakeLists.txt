@@ -1,13 +1,16 @@
 add_lldb_unittest(InterpreterTests
   TestCommandPaths.cpp
+  TestCommandReturnObject.cpp
   TestCompletion.cpp
   TestOptionArgParser.cpp
   TestOptions.cpp
   TestOptionValue.cpp
   TestOptionValueFileColonLine.cpp
   TestRegexCommand.cpp
+  TestScriptedInterface.cpp
 
   LINK_LIBS
+      lldbCommands
       lldbCore
       lldbHost
       lldbTarget

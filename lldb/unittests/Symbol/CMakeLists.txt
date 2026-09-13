@@ -1,16 +1,20 @@
 add_lldb_unittest(SymbolTests
   JSONSymbolTest.cpp
+  LineTableTest.cpp
   LocateSymbolFileTest.cpp
   MangledTest.cpp
   PostfixExpressionTest.cpp
+  SymbolLocatorTest.cpp
   SymbolTest.cpp
   SymtabTest.cpp
+  SymStoreTest.cpp
   TestTypeSystem.cpp
   TestTypeSystemClang.cpp
   TestClangASTImporter.cpp
   TestDWARFCallFrameInfo.cpp
   TestType.cpp
   TestLineEntry.cpp
+  UnwindPlanTest.cpp
 
   LINK_LIBS
     lldbCore
@@ -22,6 +26,7 @@ add_lldb_unittest(SymbolTests
     lldbPluginSymbolFileDWARF
     lldbPluginSymbolFileSymtab
     lldbPluginTypeSystemClang
+    lldbPluginSymbolLocatorSymStore
     LLVMTestingSupport
   )
 

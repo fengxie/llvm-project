@@ -1,4 +1,4 @@
-# RUN: llc -mtriple=aarch64 -run-pass=prologepilog -run-pass=machine-outliner \
+# RUN: llc -mtriple=aarch64 -run-pass=prolog-epilog -run-pass=machine-outliner \
 # RUN: -verify-machineinstrs -run-pass=aarch64-ptrauth %s -o - | FileCheck %s
 
 # Check that we save LR to a callee-saved register when possible.
@@ -126,6 +126,6 @@ body:             |
 # CHECK:         body:
 # CHECK-NEXT:     bb.0:
 # CHECK-NOT:        frame-setup EMITBKEY
-# CHECK-NOT:        frame-setup PACI{{[A,B]]}}SP
+# CHECK-NOT:        frame-setup PACI{{[A,B]}}SP
 # CHECK-NOT:        frame-setup CFI_INSTRUCTION negate_ra_sign_state
-# CHECK-NOT:        frame-destroy AUTI{{[A,B]]}}SP
+# CHECK-NOT:        frame-destroy AUTI{{[A,B]}}SP

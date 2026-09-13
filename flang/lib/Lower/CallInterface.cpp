@@ -7,22 +7,24 @@
 //===----------------------------------------------------------------------===//
 
 #include "flang/Lower/CallInterface.h"
-#include "flang/Common/Fortran.h"
 #include "flang/Evaluate/fold.h"
 #include "flang/Lower/Bridge.h"
+#include "flang/Lower/ConvertCall.h"
 #include "flang/Lower/Mangler.h"
+#include "flang/Lower/OpenACC.h"
+#include "flang/Lower/OpenMP.h"
 #include "flang/Lower/PFTBuilder.h"
 #include "flang/Lower/StatementContext.h"
 #include "flang/Lower/Support/Utils.h"
 #include "flang/Optimizer/Builder/Character.h"
 #include "flang/Optimizer/Builder/FIRBuilder.h"
 #include "flang/Optimizer/Builder/Todo.h"
-#include "flang/Optimizer/Dialect/FIRDialect.h"
 #include "flang/Optimizer/Dialect/FIROpsSupport.h"
 #include "flang/Optimizer/Support/InternalNames.h"
 #include "flang/Optimizer/Support/Utils.h"
 #include "flang/Semantics/symbol.h"
 #include "flang/Semantics/tools.h"
+#include "flang/Support/Fortran.h"
 #include <optional>
 
 static mlir::FunctionType
@@ -60,6 +62,27 @@ bool Fortran::lower::CallerInterface::hasAlternateReturns() const {
   return procRef.hasAlternateReturns();
 }
 
+/// If \p proc refers to a base procedure that carries OpenMP DECLARE VARIANT
+/// entries, return the variant selected for the enclosing OpenMP context: a
+/// direct call to the base is then lowered as a call to that variant. Returns
+/// nullptr when \p proc is not such a base call, or when no variant matches the
+/// context, so the base procedure is used as usual.
+static const Fortran::semantics::Symbol *
+getOmpDeclareVariantCallee(const Fortran::evaluate::ProcedureDesignator &proc,
+                           Fortran::lower::AbstractConverter &converter) {
+  const Fortran::semantics::Symbol *symbol = proc.GetSymbol();
+  if (!symbol)
+    return nullptr;
+  const Fortran::semantics::Symbol &ultimate{symbol->GetUltimate()};
+  // Only pay the cost of declare-variant resolution when the callee actually
+  // carries variant entries; this avoids overhead on every other call.
+  const auto *details =
+      ultimate.detailsIf<Fortran::semantics::SubprogramDetails>();
+  if (!details || details->ompDeclareVariants().empty())
+    return nullptr;
+  return Fortran::lower::omp::resolveDeclareVariantCallee(ultimate, converter);
+}
+
 /// Return the binding label (from BIND(C...)) or the mangled name of the
 /// symbol.
 static std::string
@@ -73,11 +96,23 @@ getProcMangledName(const Fortran::evaluate::ProcedureDesignator &proc,
 }
 
 std::string Fortran::lower::CallerInterface::getMangledName() const {
+  // A matching OpenMP DECLARE VARIANT call targets the variant procedure.
+  // This substitution applies only to an actual call to the base procedure.
+  // Other references to the base (e.g. taking its address to pass it as an
+  // actual argument or to associate it with a procedure pointer) go through
+  // getProcMangledName and are intentionally not redirected to the variant.
+  if (const Fortran::semantics::Symbol *variant =
+          getOmpDeclareVariantCallee(procRef.proc(), converter))
+    return converter.mangleName(*variant);
   return getProcMangledName(procRef.proc(), converter);
 }
 
 const Fortran::semantics::Symbol *
 Fortran::lower::CallerInterface::getProcedureSymbol() const {
+  // A matching OpenMP DECLARE VARIANT call targets the variant procedure.
+  if (const Fortran::semantics::Symbol *variant =
+          getOmpDeclareVariantCallee(procRef.proc(), converter))
+    return variant;
   return procRef.proc().GetSymbol();
 }
 
@@ -102,7 +137,7 @@ bool Fortran::lower::CallerInterface::requireDispatchCall() const {
       return true;
   }
   // calls with PASS attribute have the passed-object already set in its
-  // arguments. Just check if their is one.
+  // arguments. Just check if there is one.
   std::optional<unsigned> passArg = getPassArgIndex();
   if (passArg)
     return true;
@@ -177,17 +212,48 @@ mlir::Location Fortran::lower::CallerInterface::getCalleeLocation() const {
 // explicit.
 static Fortran::evaluate::characteristics::DummyDataObject
 asImplicitArg(Fortran::evaluate::characteristics::DummyDataObject &&dummy) {
-  Fortran::evaluate::Shape shape =
-      dummy.type.attrs().none() ? dummy.type.shape()
-                                : Fortran::evaluate::Shape(dummy.type.Rank());
+  std::optional<Fortran::evaluate::Shape> shape =
+      dummy.type.attrs().none()
+          ? dummy.type.shape()
+          : std::make_optional<Fortran::evaluate::Shape>(dummy.type.Rank());
   return Fortran::evaluate::characteristics::DummyDataObject(
       Fortran::evaluate::characteristics::TypeAndShape(dummy.type.type(),
                                                        std::move(shape)));
 }
 
+/// Return true when this dummy is in the subset for which CallInterface may
+/// safely emit the FIR marker that is later translated to LLVM `readonly`.
+///
+/// For non-descriptor arguments, limit this to non-character intrinsic
+/// scalars. Array and derived-type arguments are excluded because
+/// compiler-generated copy-out may write back through a forwarded dummy
+/// argument without an INTENT contract. INTENT(IN) POINTER and ALLOCATABLE
+/// dummies are also supported: in their case, `readonly` only protects the
+/// descriptor storage, not data addressed by the descriptor. ASYNCHRONOUS
+/// memory may change underneath the callee; VOLATILE+INTENT(IN) is prohibited
+/// by the standard (C870) but is excluded defensively. TARGET does not
+/// invalidate `readonly`, which only constrains writes through the argument.
+static bool dummyArgCanUseLLVMReadonly(
+    const Fortran::evaluate::characteristics::DummyDataObject &obj) {
+  using Attrs = Fortran::evaluate::characteristics::DummyDataObject::Attr;
+  using TypeAttrs = Fortran::evaluate::characteristics::TypeAndShape::Attr;
+  const Fortran::common::TypeCategory category = obj.type.type().category();
+  const bool isSupportedIntrinsicScalar =
+      obj.type.Rank() == 0 && !obj.type.attrs().test(TypeAttrs::AssumedRank) &&
+      category != Fortran::common::TypeCategory::Character &&
+      category != Fortran::common::TypeCategory::Derived;
+  const bool isDescriptorDummy =
+      obj.attrs.test(Attrs::Pointer) || obj.attrs.test(Attrs::Allocatable);
+  return obj.intent == Fortran::common::Intent::In &&
+         (isSupportedIntrinsicScalar || isDescriptorDummy) &&
+         !obj.attrs.test(Attrs::Value) &&
+         !obj.attrs.test(Attrs::Asynchronous) &&
+         !obj.attrs.test(Attrs::Volatile);
+}
+
 static Fortran::evaluate::characteristics::DummyArgument
 asImplicitArg(Fortran::evaluate::characteristics::DummyArgument &&dummy) {
-  return std::visit(
+  return Fortran::common::visit(
       Fortran::common::visitors{
           [&](Fortran::evaluate::characteristics::DummyDataObject &obj) {
             return Fortran::evaluate::characteristics::DummyArgument(
@@ -224,8 +290,7 @@ Fortran::lower::CallerInterface::characterize() const {
   // ProcedureDesignator has no interface, or may mismatch in case of implicit
   // interface.
   if (!characteristic->HasExplicitInterface() ||
-      (converter.getLoweringOptions().getLowerToHighLevelFIR() &&
-       isExternalDefinedInSameCompilationUnit(procRef.proc()) &&
+      (isExternalDefinedInSameCompilationUnit(procRef.proc()) &&
        characteristic->CanBeCalledViaImplicitInterface())) {
     // In HLFIR lowering, calls to subprogram with implicit interfaces are
     // always prepared according to the actual arguments. This is to support
@@ -581,6 +646,7 @@ mlir::Value Fortran::lower::CalleeInterface::getHostAssociatedTuple() const {
 
 static void addSymbolAttribute(mlir::func::FuncOp func,
                                const Fortran::semantics::Symbol &sym,
+                               fir::FortranProcedureFlagsEnumAttr procAttrs,
                                mlir::MLIRContext &mlirContext) {
   const Fortran::semantics::Symbol &ultimate = sym.GetUltimate();
   // The link between an internal procedure and its host procedure is lost
@@ -610,6 +676,9 @@ static void addSymbolAttribute(mlir::func::FuncOp func,
     }
   }
 
+  if (procAttrs)
+    func->setAttr(fir::getFortranProcedureFlagsAttrName(), procAttrs);
+
   // Only add this on bind(C) functions for which the symbol is not reflected in
   // the current context.
   if (!Fortran::semantics::IsBindCProcedure(sym))
@@ -638,12 +707,16 @@ setCUDAAttributes(mlir::func::FuncOp func,
                 .detailsIf<Fortran::semantics::SubprogramDetails>()) {
       mlir::Type i64Ty = mlir::IntegerType::get(func.getContext(), 64);
       if (!details->cudaLaunchBounds().empty()) {
-        assert(details->cudaLaunchBounds().size() >= 2 &&
-               "expect at least 2 values");
+        assert(details->cudaLaunchBounds().size() >= 1 &&
+               details->cudaLaunchBounds().size() <= 3 &&
+               "expect 1, 2, or 3 values");
         auto maxTPBAttr =
             mlir::IntegerAttr::get(i64Ty, details->cudaLaunchBounds()[0]);
-        auto minBPMAttr =
-            mlir::IntegerAttr::get(i64Ty, details->cudaLaunchBounds()[1]);
+        // The minimum-blocks-per-multiprocessor operand is optional.
+        mlir::IntegerAttr minBPMAttr;
+        if (details->cudaLaunchBounds().size() > 1)
+          minBPMAttr =
+              mlir::IntegerAttr::get(i64Ty, details->cudaLaunchBounds()[1]);
         mlir::IntegerAttr ubAttr;
         if (details->cudaLaunchBounds().size() > 2)
           ubAttr =
@@ -691,6 +764,7 @@ void Fortran::lower::CallInterface<T>::declare() {
     func = fir::FirOpBuilder::getNamedFunction(module, symbolTable, name);
     if (!func) {
       mlir::Location loc = side().getCalleeLocation();
+      mlir::MLIRContext &mlirContext = converter.getMLIRContext();
       mlir::FunctionType ty = genFunctionType();
       func =
           fir::FirOpBuilder::createFunction(loc, module, name, ty, symbolTable);
@@ -700,7 +774,8 @@ void Fortran::lower::CallInterface<T>::declare() {
                         mlir::StringAttr::get(&converter.getMLIRContext(),
                                               sym->name().ToString()));
         } else {
-          addSymbolAttribute(func, *sym, converter.getMLIRContext());
+          addSymbolAttribute(func, *sym, getProcedureAttrs(&mlirContext),
+                             mlirContext);
         }
       }
       for (const auto &placeHolder : llvm::enumerate(inputs))
@@ -708,6 +783,23 @@ void Fortran::lower::CallInterface<T>::declare() {
           func.setArgAttrs(placeHolder.index(), placeHolder.value().attributes);
 
       setCUDAAttributes(func, side().getProcedureSymbol(), characteristic);
+
+      if (const Fortran::semantics::Symbol *sym = side().getProcedureSymbol()) {
+        const Fortran::semantics::Symbol &ultimate{sym->GetUltimate()};
+        if (const auto *subpDetails{
+                ultimate.detailsIf<Fortran::semantics::SubprogramDetails>()}) {
+          if (!subpDetails->openACCRoutineInfos().empty()) {
+            genOpenACCRoutineConstruct(converter, module, func,
+                                       subpDetails->openACCRoutineInfos());
+          }
+        } else if (const auto *procDetails{ultimate.detailsIf<
+                       Fortran::semantics::ProcEntityDetails>()}) {
+          if (!procDetails->openACCRoutineInfos().empty()) {
+            genOpenACCRoutineConstruct(converter, module, func,
+                                       procDetails->openACCRoutineInfos());
+          }
+        }
+      }
     }
   }
 }
@@ -832,7 +924,7 @@ public:
     for (auto pair : llvm::zip(procedure.dummyArguments, argumentEntities)) {
       const Fortran::evaluate::characteristics::DummyArgument
           &argCharacteristics = std::get<0>(pair);
-      std::visit(
+      Fortran::common::visit(
           Fortran::common::visitors{
               [&](const auto &dummy) {
                 const auto &entity = getDataObjectEntity(std::get<1>(pair));
@@ -866,7 +958,7 @@ public:
     for (auto pair : llvm::zip(procedure.dummyArguments, argumentEntities)) {
       const Fortran::evaluate::characteristics::DummyArgument
           &argCharacteristics = std::get<0>(pair);
-      std::visit(
+      Fortran::common::visit(
           Fortran::common::visitors{
               [&](const Fortran::evaluate::characteristics::DummyDataObject
                       &dummy) {
@@ -1060,8 +1152,15 @@ private:
     } else {
       // non-PDT derived type allowed in implicit interface.
       mlir::Type refType = getRefType(dynamicType, obj);
+      llvm::SmallVector<mlir::NamedAttribute> attrs = dummyNameAttr(entity);
+      // Propagate the INTENT(IN) contract for by-reference dummies handled by
+      // the implicit-interface path.
+      if (dummyArgCanUseLLVMReadonly(obj))
+        attrs.emplace_back(
+            mlir::StringAttr::get(&mlirContext, fir::getReadOnlyAttrName()),
+            mlir::UnitAttr::get(&mlirContext));
       addFirOperand(refType, nextPassedArgPosition(), Property::BaseAddress,
-                    dummyNameAttr(entity));
+                    attrs);
       addPassedArg(PassEntityBy::BaseAddress, entity, characteristics);
     }
   }
@@ -1100,17 +1199,19 @@ private:
     };
     if (obj.attrs.test(Attrs::Optional))
       addMLIRAttr(fir::getOptionalAttrName());
-    // Skipping obj.attrs.test(Attrs::Asynchronous), this does not impact the
-    // way the argument is passed given flang implement asynch IO synchronously.
-    // TODO: it would be safer to treat them as volatile because since Fortran
-    // 2018 asynchronous can also be used for C defined asynchronous user
-    // processes (see 18.10.4 Asynchronous communication).
     if (obj.attrs.test(Attrs::Contiguous))
       addMLIRAttr(fir::getContiguousAttrName());
     if (obj.attrs.test(Attrs::Value))
       isValueAttr = true; // TODO: do we want an mlir::Attribute as well?
-    if (obj.attrs.test(Attrs::Volatile))
-      TODO(loc, "VOLATILE in procedure interface");
+
+    // obj.attrs.test(Attrs::Asynchronous) does not impact the way the argument
+    // is passed given flang implement asynch IO synchronously. However, it's
+    // added to determine whether the argument is captured.
+    // TODO: it would be safer to treat them as volatile because since Fortran
+    // 2018 asynchronous can also be used for C defined asynchronous user
+    // processes (see 18.10.4 Asynchronous communication).
+    if (obj.attrs.test(Attrs::Asynchronous))
+      addMLIRAttr(fir::getAsynchronousAttrName());
     if (obj.attrs.test(Attrs::Target))
       addMLIRAttr(fir::getTargetAttrName());
     if (obj.cudaDataAttr)
@@ -1118,12 +1219,14 @@ private:
           mlir::StringAttr::get(&mlirContext, cuf::getDataAttrName()),
           cuf::getDataAttribute(&mlirContext, obj.cudaDataAttr));
 
+    // Mark the supported subset of INTENT(IN) by-reference dummies readonly
+    // (see dummyArgCanUseLLVMReadonly).
+    if (dummyArgCanUseLLVMReadonly(obj))
+      addMLIRAttr(fir::getReadOnlyAttrName());
+
     // TODO: intents that require special care (e.g finalization)
 
-    using ShapeAttr = Fortran::evaluate::characteristics::TypeAndShape::Attr;
-    const Fortran::evaluate::characteristics::TypeAndShape::Attrs &shapeAttrs =
-        obj.type.attrs();
-    if (shapeAttrs.test(ShapeAttr::Coarray))
+    if (obj.type.corank() > 0)
       TODO(loc, "coarray: dummy argument coarray in procedure interface");
 
     // So far assume that if the argument cannot be passed by implicit interface
@@ -1142,15 +1245,13 @@ private:
 
     if (obj.attrs.test(Attrs::Allocatable) || obj.attrs.test(Attrs::Pointer)) {
       // Pass as fir.ref<fir.box> or fir.ref<fir.class>
-      mlir::Type boxRefType = fir::ReferenceType::get(boxType);
+      const bool isVolatile = obj.attrs.test(Attrs::Volatile);
+      mlir::Type boxRefType = fir::ReferenceType::get(boxType, isVolatile);
       addFirOperand(boxRefType, nextPassedArgPosition(), Property::MutableBox,
                     attrs);
       addPassedArg(PassEntityBy::MutableBox, entity, characteristics);
     } else if (obj.IsPassedByDescriptor(isBindC)) {
       // Pass as fir.box or fir.class
-      if (isValueAttr &&
-          !getConverter().getLoweringOptions().getLowerToHighLevelFIR())
-        TODO(loc, "assumed shape dummy argument with VALUE attribute");
       addFirOperand(boxType, nextPassedArgPosition(), Property::Box, attrs);
       addPassedArg(PassEntityBy::Box, entity, characteristics);
     } else if (dynamicType.category() ==
@@ -1191,6 +1292,9 @@ private:
           if (isBuiltinCptrType) {
             auto recTy = mlir::dyn_cast<fir::RecordType>(type);
             mlir::Type fieldTy = recTy.getTypeList()[0].second;
+            if (fir::isa_builtin_cdevptr_type(type))
+              fieldTy =
+                  mlir::cast<fir::RecordType>(fieldTy).getTypeList()[0].second;
             passType = fir::ReferenceType::get(fieldTy);
           } else {
             passType = type;
@@ -1208,11 +1312,6 @@ private:
       const DummyCharacteristics *characteristics,
       const Fortran::evaluate::characteristics::DummyProcedure &proc,
       const FortranEntity &entity) {
-    if (!interface.converter.getLoweringOptions().getLowerToHighLevelFIR() &&
-        proc.attrs.test(
-            Fortran::evaluate::characteristics::DummyProcedure::Attr::Pointer))
-      TODO(interface.converter.getCurrentLocation(),
-           "procedure pointer arguments");
     const Fortran::evaluate::characteristics::Procedure &procedure =
         proc.procedure.value();
     mlir::Type funcType =
@@ -1297,18 +1396,17 @@ private:
   // with the shape (may contain unknown extents) for arrays.
   std::optional<fir::SequenceType::Shape> getBounds(
       const Fortran::evaluate::characteristics::TypeAndShape &typeAndShape) {
-    using ShapeAttr = Fortran::evaluate::characteristics::TypeAndShape::Attr;
-    if (typeAndShape.shape().empty() &&
-        !typeAndShape.attrs().test(ShapeAttr::AssumedRank))
+    if (typeAndShape.shape() && typeAndShape.shape()->empty())
       return std::nullopt;
     fir::SequenceType::Shape bounds;
-    for (const std::optional<Fortran::evaluate::ExtentExpr> &extent :
-         typeAndShape.shape()) {
-      fir::SequenceType::Extent bound = fir::SequenceType::getUnknownExtent();
-      if (std::optional<std::int64_t> i = toInt64(extent))
-        bound = *i;
-      bounds.emplace_back(bound);
-    }
+    if (typeAndShape.shape())
+      for (const std::optional<Fortran::evaluate::ExtentExpr> &extent :
+           *typeAndShape.shape()) {
+        fir::SequenceType::Extent bound = fir::SequenceType::getUnknownExtent();
+        if (std::optional<std::int64_t> i = toInt64(extent))
+          bound = *i;
+        bounds.emplace_back(bound);
+      }
     return bounds;
   }
   std::optional<std::int64_t>
@@ -1320,15 +1418,13 @@ private:
           getConverter().getFoldingContext(), toEvExpr(*expr)));
     return std::nullopt;
   }
-  void addFirOperand(
-      mlir::Type type, int entityPosition, Property p,
-      llvm::ArrayRef<mlir::NamedAttribute> attributes = std::nullopt) {
+  void addFirOperand(mlir::Type type, int entityPosition, Property p,
+                     llvm::ArrayRef<mlir::NamedAttribute> attributes = {}) {
     interface.inputs.emplace_back(
         FirPlaceHolder{type, entityPosition, p, attributes});
   }
-  void
-  addFirResult(mlir::Type type, int entityPosition, Property p,
-               llvm::ArrayRef<mlir::NamedAttribute> attributes = std::nullopt) {
+  void addFirResult(mlir::Type type, int entityPosition, Property p,
+                    llvm::ArrayRef<mlir::NamedAttribute> attributes = {}) {
     interface.outputs.emplace_back(
         FirPlaceHolder{type, entityPosition, p, attributes});
   }
@@ -1535,6 +1631,52 @@ Fortran::lower::CallInterface<T>::getResultType() const {
   return types;
 }
 
+template <typename T>
+fir::FortranProcedureFlagsEnumAttr
+Fortran::lower::CallInterface<T>::getProcedureAttrs(
+    mlir::MLIRContext *mlirContext) const {
+  fir::FortranProcedureFlagsEnum flags = fir::FortranProcedureFlagsEnum::none;
+  if (characteristic) {
+    if (characteristic->IsBindC())
+      flags = flags | fir::FortranProcedureFlagsEnum::bind_c;
+    if (characteristic->IsPure())
+      flags = flags | fir::FortranProcedureFlagsEnum::pure;
+    if (characteristic->IsElemental())
+      flags = flags | fir::FortranProcedureFlagsEnum::elemental;
+    // TODO:
+    // - SIMPLE: F2023, not yet handled by semantics.
+  }
+
+  if constexpr (std::is_same_v<Fortran::lower::CalleeInterface, T>) {
+    // Only gather and set NON_RECURSIVE for procedure definition. It is
+    // meaningless on calls since this is not part of Fortran characteristics
+    // (Fortran 2023 15.3.1) so there is no way to always know if the procedure
+    // called is recursive or not.
+    if (const Fortran::semantics::Symbol *sym = side().getProcedureSymbol()) {
+      // Note: By default procedures are RECURSIVE unless
+      // -fno-automatic/-save/-Msave is set. NON_RECURSIVE is made explicit
+      // in that case in FIR.
+      if (sym->attrs().test(Fortran::semantics::Attr::NON_RECURSIVE) ||
+          (sym->owner().context().languageFeatures().IsEnabled(
+               Fortran::common::LanguageFeature::DefaultSave) &&
+           !sym->attrs().test(Fortran::semantics::Attr::RECURSIVE)))
+        flags = flags | fir::FortranProcedureFlagsEnum::non_recursive;
+
+      // Set RECURSIVE if the attribute is explicitly present.  This is only
+      // used for debug info generation to maintain consistency with pre-F2018
+      // compilers.
+      if (sym->attrs().test(Fortran::semantics::Attr::RECURSIVE))
+        flags = flags | fir::FortranProcedureFlagsEnum::recursive;
+    }
+  }
+  if constexpr (std::is_same_v<Fortran::lower::CallerInterface, T>)
+    if (Fortran::lower::isIntrinsicModuleProcRef(side().getCallDescription()))
+      flags = flags | fir::FortranProcedureFlagsEnum::intrinsic;
+  if (flags != fir::FortranProcedureFlagsEnum::none)
+    return fir::FortranProcedureFlagsEnumAttr::get(mlirContext, flags);
+  return nullptr;
+}
+
 template class Fortran::lower::CallInterface<Fortran::lower::CalleeInterface>;
 template class Fortran::lower::CallInterface<Fortran::lower::CallerInterface>;
 
@@ -1710,6 +1852,17 @@ mlir::Type Fortran::lower::getDummyProcedureType(
   if (::mustPassLengthWithDummyProcedure(iface))
     return fir::factory::getCharacterProcedureTupleType(procType);
   return procType;
+}
+
+mlir::Type Fortran::lower::getDummyProcedurePointerType(
+    const Fortran::semantics::Symbol &dummyProcPtr,
+    Fortran::lower::AbstractConverter &converter) {
+  std::optional<Fortran::evaluate::characteristics::Procedure> iface =
+      Fortran::evaluate::characteristics::Procedure::Characterize(
+          dummyProcPtr, converter.getFoldingContext());
+  mlir::Type procPtrType = getProcedureDesignatorType(
+      iface.has_value() ? &*iface : nullptr, converter);
+  return fir::ReferenceType::get(procPtrType);
 }
 
 bool Fortran::lower::isCPtrArgByValueType(mlir::Type ty) {

@@ -63,7 +63,7 @@ bool CppModuleConfiguration::analyzeFile(const FileSpec &f,
                                          const llvm::Triple &triple) {
   using namespace llvm::sys::path;
   // Convert to slashes to make following operations simpler.
-  std::string dir_buffer = convert_to_slash(f.GetDirectory().GetStringRef());
+  std::string dir_buffer = convert_to_slash(f.GetDirectory());
   llvm::StringRef posix_dir(dir_buffer);
 
   // Check for /c++/vX/ that is used by libc++.
@@ -71,7 +71,7 @@ bool CppModuleConfiguration::analyzeFile(const FileSpec &f,
   // If the path is in the libc++ include directory use it as the found libc++
   // path. Ignore subdirectories such as /c++/v1/experimental as those don't
   // need to be specified in the header search.
-  if (libcpp_regex.match(f.GetPath()) &&
+  if (libcpp_regex.match(convert_to_slash(f.GetPath())) &&
       parent_path(posix_dir, Style::posix).ends_with("c++")) {
     if (!m_std_inc.TrySet(posix_dir))
       return false;

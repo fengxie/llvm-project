@@ -1,7 +1,7 @@
 ; Tests that the coro.destroy and coro.resume are devirtualized where possible,
 ; SCC pipeline restarts and inlines the direct calls.
 ; RUN: opt < %s -S \
-; RUN: -passes='cgscc(repeat<2>(inline,function(coro-elide,dce)))' \
+; RUN: -passes='cgscc(inline,function(coro-elide,dce),inline,function(coro-elide,dce))' \
 ; RUN:   | FileCheck %s
 
 declare void @print(i32) nounwind
@@ -146,6 +146,20 @@ entry:
   call fastcc void %1(ptr %hdl)
 
 ; CHECK: ret void
+  ret void
+}
+
+; Test that coroutines, when feasible, are elided without requiring inlining.
+define void @noinline_elision() {
+; CHECK-LABEL: define void @noinline_elision() {
+; CHECK-NEXT:  [[ENTRY:.*:]]
+; CHECK-NEXT:    ret void
+;
+entry:
+  %id = call token @llvm.coro.id(i32 0, ptr null, ptr @noinline_elision, ptr @f.resumers)
+  %alloc = call i1 @llvm.coro.alloc(token %id)
+  %hdl = call ptr @llvm.coro.begin(token %id, ptr null)
+  call void @llvm.coro.dead(ptr %hdl)
   ret void
 }
 

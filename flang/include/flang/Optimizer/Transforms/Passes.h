@@ -9,9 +9,8 @@
 #ifndef FORTRAN_OPTIMIZER_TRANSFORMS_PASSES_H
 #define FORTRAN_OPTIMIZER_TRANSFORMS_PASSES_H
 
-#include "flang/Optimizer/Dialect/FIROps.h"
+#include "flang/Optimizer/Support/AllocationPolicy.h"
 #include "mlir/Dialect/LLVMIR/LLVMAttrs.h"
-#include "mlir/Dialect/OpenMP/OpenMPDialect.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassRegistry.h"
 #include <memory>
@@ -27,38 +26,30 @@ class ModuleOp;
 
 namespace fir {
 
+/// Controls hoisting of invariant ops from nested regions (e.g. scf.if
+/// within loops) in the flang-licm pass.
+enum class LICMNestedHoistingMode {
+  None,       ///< Do not hoist from nested regions.
+  Cheap,      ///< Only hoist cheap ops like fir.convert.
+  Aggressive, ///< Hoist all safe invariant ops.
+};
+
 //===----------------------------------------------------------------------===//
 // Passes defined in Passes.td
 //===----------------------------------------------------------------------===//
 
-#define GEN_PASS_DECL_ABSTRACTRESULTOPT
-#define GEN_PASS_DECL_AFFINEDIALECTPROMOTION
-#define GEN_PASS_DECL_AFFINEDIALECTDEMOTION
-#define GEN_PASS_DECL_ANNOTATECONSTANTOPERANDS
-#define GEN_PASS_DECL_ARRAYVALUECOPY
-#define GEN_PASS_DECL_CHARACTERCONVERSION
-#define GEN_PASS_DECL_CFGCONVERSION
-#define GEN_PASS_DECL_EXTERNALNAMECONVERSION
-#define GEN_PASS_DECL_MEMREFDATAFLOWOPT
-#define GEN_PASS_DECL_SIMPLIFYINTRINSICS
-#define GEN_PASS_DECL_MEMORYALLOCATIONOPT
-#define GEN_PASS_DECL_SIMPLIFYREGIONLITE
-#define GEN_PASS_DECL_ALGEBRAICSIMPLIFICATION
-#define GEN_PASS_DECL_POLYMORPHICOPCONVERSION
-#define GEN_PASS_DECL_OPENACCDATAOPERANDCONVERSION
-#define GEN_PASS_DECL_ADDDEBUGINFO
-#define GEN_PASS_DECL_STACKARRAYS
-#define GEN_PASS_DECL_LOOPVERSIONING
-#define GEN_PASS_DECL_ADDALIASTAGS
+#define GEN_PASS_DECL
+
 #include "flang/Optimizer/Transforms/Passes.h.inc"
 
+/// Create the allocation-placement pass with the given options and a hook that
+/// can override the thresholds per allocation (e.g. for device routines or
+/// parallel regions). This complements the tablegen-generated overloads.
+std::unique_ptr<mlir::Pass>
+createAllocationPlacement(const AllocationPlacementOptions &options,
+                          AllocationPlacementHook placementHook);
+
 std::unique_ptr<mlir::Pass> createAffineDemotionPass();
-std::unique_ptr<mlir::Pass>
-createArrayValueCopyPass(fir::ArrayValueCopyOptions options = {});
-std::unique_ptr<mlir::Pass> createCFGConversionPassWithNSW();
-std::unique_ptr<mlir::Pass> createExternalNameConversionPass();
-std::unique_ptr<mlir::Pass>
-createExternalNameConversionPass(bool appendUnderscore);
 std::unique_ptr<mlir::Pass> createMemDataFlowOptPass();
 std::unique_ptr<mlir::Pass> createPromoteToAffinePass();
 std::unique_ptr<mlir::Pass>
@@ -69,29 +60,20 @@ std::unique_ptr<mlir::Pass> createAlgebraicSimplificationPass();
 std::unique_ptr<mlir::Pass>
 createAlgebraicSimplificationPass(const mlir::GreedyRewriteConfig &config);
 
-std::unique_ptr<mlir::Pass> createOMPMapInfoFinalizationPass();
-std::unique_ptr<mlir::Pass> createOMPFunctionFilteringPass();
-std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>>
-createOMPMarkDeclareTargetPass();
-
 std::unique_ptr<mlir::Pass> createVScaleAttrPass();
 std::unique_ptr<mlir::Pass>
 createVScaleAttrPass(std::pair<unsigned, unsigned> vscaleAttr);
 
-struct FunctionAttrTypes {
-  mlir::LLVM::framePointerKind::FramePointerKind framePointerKind =
-      mlir::LLVM::framePointerKind::FramePointerKind::None;
-};
-
-std::unique_ptr<mlir::Pass> createFunctionAttrPass();
-std::unique_ptr<mlir::Pass>
-createFunctionAttrPass(FunctionAttrTypes &functionAttr, bool noInfsFPMath,
-                       bool noNaNsFPMath, bool approxFuncFPMath,
-                       bool noSignedZerosFPMath, bool unsafeFPMath);
+void populateFIRToSCFRewrites(mlir::RewritePatternSet &patterns,
+                              bool parallelUnordered = false,
+                              bool setNSW = true);
 
 void populateCfgConversionRewrites(mlir::RewritePatternSet &patterns,
                                    bool forceLoopToExecuteOnce = false,
-                                   bool setNSW = false);
+                                   bool setNSW = true);
+
+void populateSimplifyFIROperationsPatterns(mlir::RewritePatternSet &patterns,
+                                           bool preferInlineImplementation);
 
 // declarative passes
 #define GEN_PASS_REGISTRATION

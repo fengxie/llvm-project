@@ -71,14 +71,15 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "SIOptimizeVGPRLiveRange.h"
 #include "AMDGPU.h"
 #include "GCNSubtarget.h"
-#include "MCTargetDesc/AMDGPUMCTargetDesc.h"
 #include "SIMachineFunctionInfo.h"
 #include "llvm/CodeGen/LiveVariables.h"
 #include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/InitializePasses.h"
 
 using namespace llvm;
@@ -87,7 +88,7 @@ using namespace llvm;
 
 namespace {
 
-class SIOptimizeVGPRLiveRange : public MachineFunctionPass {
+class SIOptimizeVGPRLiveRange {
 private:
   const SIRegisterInfo *TRI = nullptr;
   const SIInstrInfo *TII = nullptr;
@@ -97,7 +98,10 @@ private:
   MachineRegisterInfo *MRI = nullptr;
 
 public:
-  static char ID;
+  SIOptimizeVGPRLiveRange(LiveVariables *LV, MachineDominatorTree *MDT,
+                          MachineLoopInfo *Loops)
+      : LV(LV), MDT(MDT), Loops(Loops) {}
+  bool run(MachineFunction &MF);
 
   MachineBasicBlock *getElseTarget(MachineBasicBlock *MBB) const;
 
@@ -137,8 +141,13 @@ public:
       Register Reg, MachineBasicBlock *LoopHeader,
       SmallSetVector<MachineBasicBlock *, 2> &LoopBlocks,
       SmallVectorImpl<MachineInstr *> &Instructions) const;
+};
 
-  SIOptimizeVGPRLiveRange() : MachineFunctionPass(ID) {}
+class SIOptimizeVGPRLiveRangeLegacy : public MachineFunctionPass {
+public:
+  static char ID;
+
+  SIOptimizeVGPRLiveRangeLegacy() : MachineFunctionPass(ID) {}
 
   bool runOnMachineFunction(MachineFunction &MF) override;
 
@@ -147,23 +156,20 @@ public:
   }
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
-    AU.addRequired<LiveVariables>();
-    AU.addRequired<MachineDominatorTree>();
-    AU.addRequired<MachineLoopInfo>();
-    AU.addPreserved<LiveVariables>();
-    AU.addPreserved<MachineDominatorTree>();
-    AU.addPreserved<MachineLoopInfo>();
+    AU.setPreservesCFG();
+    AU.addRequired<LiveVariablesWrapperPass>();
+    AU.addRequired<MachineDominatorTreeWrapperPass>();
+    AU.addRequired<MachineLoopInfoWrapperPass>();
+    AU.addPreserved<LiveVariablesWrapperPass>();
     MachineFunctionPass::getAnalysisUsage(AU);
   }
 
   MachineFunctionProperties getRequiredProperties() const override {
-    return MachineFunctionProperties().set(
-        MachineFunctionProperties::Property::IsSSA);
+    return MachineFunctionProperties().setIsSSA();
   }
 
   MachineFunctionProperties getClearedProperties() const override {
-    return MachineFunctionProperties().set(
-        MachineFunctionProperties::Property::NoPHIs);
+    return MachineFunctionProperties().setNoPHIs();
   }
 };
 
@@ -189,7 +195,7 @@ void SIOptimizeVGPRLiveRange::collectElseRegionBlocks(
   unsigned Cur = 0;
   while (MBB) {
     for (auto *Pred : MBB->predecessors()) {
-      if (Pred != Flow && !Blocks.contains(Pred))
+      if (Pred != Flow)
         Blocks.insert(Pred);
     }
 
@@ -212,7 +218,8 @@ void SIOptimizeVGPRLiveRange::findNonPHIUsesInBlock(
     Register Reg, MachineBasicBlock *MBB,
     SmallVectorImpl<MachineInstr *> &Uses) const {
   for (auto &UseMI : MRI->use_nodbg_instructions(Reg)) {
-    if (UseMI.getParent() == MBB && !UseMI.isPHI())
+    if (UseMI.getParent() == MBB && !UseMI.isPHI() &&
+        UseMI.readsVirtualRegister(Reg))
       Uses.push_back(&UseMI);
   }
 }
@@ -242,7 +249,7 @@ void SIOptimizeVGPRLiveRange::collectCandidateRegisters(
 
         if (MO.readsReg()) {
           LiveVariables::VarInfo &VI = LV->getVarInfo(MOReg);
-          const MachineBasicBlock *DefMBB = MRI->getVRegDef(MOReg)->getParent();
+          const MachineBasicBlock *DefMBB = MRI->getDefBlock(MOReg);
           // Make sure two conditions are met:
           // a.) the value is defined before/in the IF block
           // b.) should be defined in the same loop-level.
@@ -290,7 +297,7 @@ void SIOptimizeVGPRLiveRange::collectCandidateRegisters(
       // Make sure two conditions are met:
       // a.) the value is defined before/in the IF block
       // b.) should be defined in the same loop-level.
-      const MachineBasicBlock *DefMBB = MRI->getVRegDef(Reg)->getParent();
+      const MachineBasicBlock *DefMBB = MRI->getDefBlock(Reg);
       if ((VI.AliveBlocks.test(If->getNumber()) || DefMBB == If) &&
           Loops->getLoopFor(DefMBB) == Loops->getLoopFor(If))
         KillsInElse.insert(Reg);
@@ -367,7 +374,7 @@ void SIOptimizeVGPRLiveRange::collectWaterfallCandidateRegisters(
         continue;
 
       if (MO.readsReg()) {
-        MachineBasicBlock *DefMBB = MRI->getVRegDef(MOReg)->getParent();
+        MachineBasicBlock *DefMBB = MRI->getDefBlock(MOReg);
         // Make sure the value is defined before the LOOP block
         if (!Blocks.contains(DefMBB) && !CandidateRegs.contains(MOReg)) {
           // If the variable is used after the loop, the register coalescer will
@@ -407,10 +414,8 @@ void SIOptimizeVGPRLiveRange::updateLiveRangeInThenRegion(
   while (!WorkList.empty()) {
     auto *MBB = WorkList.pop_back_val();
     for (auto *Succ : MBB->successors()) {
-      if (Succ != Flow && !Blocks.contains(Succ)) {
+      if (Succ != Flow && Blocks.insert(Succ))
         WorkList.push_back(Succ);
-        Blocks.insert(Succ);
-      }
     }
   }
 
@@ -455,8 +460,7 @@ void SIOptimizeVGPRLiveRange::updateLiveRangeInThenRegion(
 
     // Mark Reg alive through the block if this is a PHI incoming block
     if (PHIIncoming.contains(MBB))
-      LV->MarkVirtRegAliveInBlock(OldVarInfo, MRI->getVRegDef(Reg)->getParent(),
-                                  MBB);
+      LV->MarkVirtRegAliveInBlock(OldVarInfo, MRI->getDefBlock(Reg), MBB);
   }
 
   // Set the isKilled flag if we get new Kills in the THEN region.
@@ -485,15 +489,12 @@ void SIOptimizeVGPRLiveRange::updateLiveRangeInElseRegion(
   }
 
   // Transfer the possible Kills in ElseBlocks from Reg to NewReg
-  auto I = OldVarInfo.Kills.begin();
-  while (I != OldVarInfo.Kills.end()) {
-    if (ElseBlocks.contains((*I)->getParent())) {
-      NewVarInfo.Kills.push_back(*I);
-      I = OldVarInfo.Kills.erase(I);
-    } else {
-      ++I;
-    }
-  }
+  llvm::erase_if(OldVarInfo.Kills, [&](MachineInstr *MI) {
+    if (!ElseBlocks.contains(MI->getParent()))
+      return false;
+    NewVarInfo.Kills.push_back(MI);
+    return true;
+  });
 }
 
 void SIOptimizeVGPRLiveRange::optimizeLiveRange(
@@ -614,34 +615,56 @@ void SIOptimizeVGPRLiveRange::optimizeWaterfallLiveRange(
   }
 }
 
-char SIOptimizeVGPRLiveRange::ID = 0;
+char SIOptimizeVGPRLiveRangeLegacy::ID = 0;
 
-INITIALIZE_PASS_BEGIN(SIOptimizeVGPRLiveRange, DEBUG_TYPE,
+INITIALIZE_PASS_BEGIN(SIOptimizeVGPRLiveRangeLegacy, DEBUG_TYPE,
                       "SI Optimize VGPR LiveRange", false, false)
-INITIALIZE_PASS_DEPENDENCY(MachineDominatorTree)
-INITIALIZE_PASS_DEPENDENCY(MachineLoopInfo)
-INITIALIZE_PASS_DEPENDENCY(LiveVariables)
-INITIALIZE_PASS_END(SIOptimizeVGPRLiveRange, DEBUG_TYPE,
+INITIALIZE_PASS_DEPENDENCY(MachineDominatorTreeWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(MachineLoopInfoWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(LiveVariablesWrapperPass)
+INITIALIZE_PASS_END(SIOptimizeVGPRLiveRangeLegacy, DEBUG_TYPE,
                     "SI Optimize VGPR LiveRange", false, false)
 
-char &llvm::SIOptimizeVGPRLiveRangeID = SIOptimizeVGPRLiveRange::ID;
+char &llvm::SIOptimizeVGPRLiveRangeLegacyID = SIOptimizeVGPRLiveRangeLegacy::ID;
 
-FunctionPass *llvm::createSIOptimizeVGPRLiveRangePass() {
-  return new SIOptimizeVGPRLiveRange();
+FunctionPass *llvm::createSIOptimizeVGPRLiveRangeLegacyPass() {
+  return new SIOptimizeVGPRLiveRangeLegacy();
 }
 
-bool SIOptimizeVGPRLiveRange::runOnMachineFunction(MachineFunction &MF) {
+bool SIOptimizeVGPRLiveRangeLegacy::runOnMachineFunction(MachineFunction &MF) {
+  if (skipFunction(MF.getFunction()))
+    return false;
 
+  LiveVariables *LV = &getAnalysis<LiveVariablesWrapperPass>().getLV();
+  MachineDominatorTree *MDT =
+      &getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
+  MachineLoopInfo *Loops = &getAnalysis<MachineLoopInfoWrapperPass>().getLI();
+  return SIOptimizeVGPRLiveRange(LV, MDT, Loops).run(MF);
+}
+
+PreservedAnalyses
+SIOptimizeVGPRLiveRangePass::run(MachineFunction &MF,
+                                 MachineFunctionAnalysisManager &MFAM) {
+  MFPropsModifier _(*this, MF);
+  LiveVariables *LV = &MFAM.getResult<LiveVariablesAnalysis>(MF);
+  MachineDominatorTree *MDT = &MFAM.getResult<MachineDominatorTreeAnalysis>(MF);
+  MachineLoopInfo *Loops = &MFAM.getResult<MachineLoopAnalysis>(MF);
+
+  bool Changed = SIOptimizeVGPRLiveRange(LV, MDT, Loops).run(MF);
+  if (!Changed)
+    return PreservedAnalyses::all();
+
+  auto PA = getMachineFunctionPassPreservedAnalyses();
+  PA.preserve<LiveVariablesAnalysis>();
+  PA.preserveSet<CFGAnalyses>();
+  return PA;
+}
+
+bool SIOptimizeVGPRLiveRange::run(MachineFunction &MF) {
   const GCNSubtarget &ST = MF.getSubtarget<GCNSubtarget>();
   TII = ST.getInstrInfo();
   TRI = &TII->getRegisterInfo();
-  MDT = &getAnalysis<MachineDominatorTree>();
-  Loops = &getAnalysis<MachineLoopInfo>();
-  LV = &getAnalysis<LiveVariables>();
   MRI = &MF.getRegInfo();
-
-  if (skipFunction(MF.getFunction()))
-    return false;
 
   bool MadeChange = false;
 

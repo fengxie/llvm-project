@@ -6,16 +6,27 @@
 //
 //===----------------------------------------------------------------------===//
 #include "startup/linux/do_start.h"
+#include "config/linux/app.h"
+#include "hdr/elf_proxy.h"
+#include "hdr/link_macros.h"
+#include "hdr/pthread_macros.h"
+#include "hdr/stdint_proxy.h"
+#include "hdr/sys_auxv_macros.h"
+#include "hdr/sys_mman_macros.h"
+#include "hdr/types/struct_link_map.h"
+#include "hdr/types/struct_r_debug.h"
+#include "src/__support/OSUtil/linux/auxv.h"
 #include "src/__support/OSUtil/syscall.h"
+#include "src/__support/macros/config.h"
 #include "src/__support/threads/thread.h"
+#include "src/errno/program_invocation_name.h"
+#include "src/errno/program_invocation_short_name.h"
+#include "src/link/_r_debug.h"
 #include "src/stdlib/atexit.h"
 #include "src/stdlib/exit.h"
 #include "src/unistd/environ.h"
-
-#include <linux/auxvec.h>
-#include <linux/elf.h>
-#include <stdint.h>
-#include <sys/mman.h>
+#include "startup/linux/gnu_property_section.h"
+#include "startup/linux/irelative.h"
 #include <sys/syscall.h>
 
 extern "C" int main(int argc, char **argv, char **envp);
@@ -33,11 +44,18 @@ extern uintptr_t __fini_array_end[];
 // This symbol is provided by the dynamic linker. It can be undefined depending
 // on how the program is loaded exactly.
 [[gnu::weak,
-  gnu::visibility("hidden")]] extern const Elf64_Dyn _DYNAMIC[]; // NOLINT
+  gnu::visibility("hidden")]] extern const ElfW(Dyn) _DYNAMIC[]; // NOLINT
+
+// Debuggers look for this function by name. Carefully consider any changes.
+void _r_debug_state() { // NOLINT
+  asm volatile("");
+}
 }
 
-namespace LIBC_NAMESPACE {
+namespace LIBC_NAMESPACE_DECL {
 AppProperties app;
+
+static struct link_map main_map;
 
 using InitCallback = void(int, char **, char **);
 using FiniCallback = void(void);
@@ -58,6 +76,7 @@ static void call_fini_array_callbacks() {
 }
 
 static ThreadAttributes main_thread_attrib;
+static TLSDescriptor tls;
 
 [[noreturn]] void do_start() {
   auto tid = syscall_impl<long>(SYS_gettid);
@@ -68,8 +87,8 @@ static ThreadAttributes main_thread_attrib;
   // After the argv array, is a 8-byte long NULL value before the array of env
   // values. The end of the env values is marked by another 8-byte long NULL
   // value. We step over it (the "+ 1" below) to get to the env values.
-  ArgVEntryType *env_ptr = app.args->argv + app.args->argc + 1;
-  ArgVEntryType *env_end_marker = env_ptr;
+  uintptr_t *env_ptr = app.args->argv + app.args->argc + 1;
+  uintptr_t *env_end_marker = env_ptr;
   app.env_ptr = env_ptr;
   while (*env_end_marker)
     ++env_end_marker;
@@ -77,41 +96,92 @@ static ThreadAttributes main_thread_attrib;
   // Initialize the POSIX global declared in unistd.h
   environ = reinterpret_cast<char **>(env_ptr);
 
+  if (app.args->argc > 0 && app.args->argv[0] != 0) {
+    program_invocation_name = reinterpret_cast<char *>(app.args->argv[0]);
+    program_invocation_short_name = program_invocation_name;
+    for (char *p = program_invocation_name; *p != '\0'; ++p) {
+      if (*p == '/')
+        program_invocation_short_name = p + 1;
+    }
+  }
+
   // After the env array, is the aux-vector. The end of the aux-vector is
   // denoted by an AT_NULL entry.
-  Elf64_Phdr *program_hdr_table = nullptr;
+  ElfW(Phdr) *program_hdr_table = nullptr;
   uintptr_t program_hdr_count = 0;
-  app.auxv_ptr = reinterpret_cast<AuxEntry *>(env_end_marker + 1);
-  for (auto *aux_entry = app.auxv_ptr; aux_entry->id != AT_NULL; ++aux_entry) {
-    switch (aux_entry->id) {
+  unsigned long hwcap = 0;
+  unsigned long hwcap2 = 0;
+  const char *execfn = nullptr;
+  auxv::Vector::initialize_unsafe(
+      reinterpret_cast<const auxv::Entry *>(env_end_marker + 1));
+  auxv::Vector auxvec;
+  for (const auto &aux_entry : auxvec) {
+    switch (aux_entry.type) {
     case AT_PHDR:
-      program_hdr_table = reinterpret_cast<Elf64_Phdr *>(aux_entry->value);
+      program_hdr_table = reinterpret_cast<ElfW(Phdr) *>(aux_entry.val);
       break;
     case AT_PHNUM:
-      program_hdr_count = aux_entry->value;
+      program_hdr_count = aux_entry.val;
       break;
     case AT_PAGESZ:
-      app.page_size = aux_entry->value;
+      app.page_size = aux_entry.val;
+      break;
+    case AT_HWCAP:
+      hwcap = aux_entry.val;
+      break;
+    case AT_HWCAP2:
+      hwcap2 = aux_entry.val;
+      break;
+    case AT_EXECFN:
+      execfn = reinterpret_cast<const char *>(aux_entry.val);
       break;
     default:
       break; // TODO: Read other useful entries from the aux vector.
     }
   }
+  // AT_EXECFN is typically the last thing on the stack. Round it up to the
+  // next page boundary.
+  uintptr_t stack_addr =
+      (reinterpret_cast<uintptr_t>(execfn) + app.page_size - 1) &
+      ~(app.page_size - 1);
+  main_thread_attrib.stack = reinterpret_cast<void *>(stack_addr);
+  main_thread_attrib.stacksize = PTHREAD_STACK_DYNAMIC_NP;
 
-  ptrdiff_t base = 0;
+  intptr_t base = 0;
   app.tls.size = 0;
-  Elf64_Phdr *tls_phdr = nullptr;
+  ElfW(Phdr) *tls_phdr = nullptr;
+  [[maybe_unused]] ElfW(Phdr) *gnu_property_phdr = nullptr;
 
   for (uintptr_t i = 0; i < program_hdr_count; ++i) {
-    Elf64_Phdr &phdr = program_hdr_table[i];
+    ElfW(Phdr) &phdr = program_hdr_table[i];
     if (phdr.p_type == PT_PHDR)
-      base = reinterpret_cast<ptrdiff_t>(program_hdr_table) - phdr.p_vaddr;
+      base = reinterpret_cast<intptr_t>(program_hdr_table) - phdr.p_vaddr;
     if (phdr.p_type == PT_DYNAMIC && _DYNAMIC)
-      base = reinterpret_cast<ptrdiff_t>(_DYNAMIC) - phdr.p_vaddr;
+      base = reinterpret_cast<intptr_t>(_DYNAMIC) - phdr.p_vaddr;
     if (phdr.p_type == PT_TLS)
       tls_phdr = &phdr;
+    if (phdr.p_type == PT_GNU_PROPERTY)
+      gnu_property_phdr = &phdr;
     // TODO: adjust PT_GNU_STACK
   }
+
+  main_map.l_addr = base;
+  main_map.l_name = const_cast<char *>("");
+  main_map.l_ld = const_cast<ElfW(Dyn) *>(_DYNAMIC);
+  main_map.l_next = nullptr;
+  main_map.l_prev = nullptr;
+
+  _r_debug.r_version = 1;
+  _r_debug.r_map = &main_map;
+  _r_debug.r_brk = reinterpret_cast<uintptr_t>(&_r_debug_state);
+  _r_debug.r_state = RT_CONSISTENT;
+  _r_debug.r_ldbase = base;
+
+  // Process IRELATIVE relocations (ifunc resolvers).
+  // Skips when no ifuncs are present in the binary.
+  if (reinterpret_cast<uintptr_t>(__rela_iplt_start) !=
+      reinterpret_cast<uintptr_t>(__rela_iplt_end))
+    apply_irelative_relocs(base, hwcap, hwcap2);
 
   app.tls.address = tls_phdr->p_vaddr + base;
   app.tls.size = tls_phdr->p_memsz;
@@ -120,18 +190,14 @@ static ThreadAttributes main_thread_attrib;
 
   // This descriptor has to be static since its cleanup function cannot
   // capture the context.
-  static TLSDescriptor tls;
   init_tls(tls);
   if (tls.size != 0 && !set_thread_ptr(tls.tp))
     syscall_impl<long>(SYS_exit, 1);
 
-  self.attrib = &main_thread_attrib;
+  internal::self.attrib = &main_thread_attrib;
   main_thread_attrib.atexit_callback_mgr =
       internal::get_thread_atexit_callback_mgr();
-  // We register the cleanup_tls function to be the last atexit callback to be
-  // invoked. It will tear down the TLS. Other callbacks may depend on TLS (such
-  // as the stack protector canary).
-  atexit([]() { cleanup_tls(tls.tp, tls.size); });
+
   // We want the fini array callbacks to be run after other atexit
   // callbacks are run. So, we register them before running the init
   // array callbacks as they can potentially register their own atexit
@@ -149,4 +215,4 @@ static ThreadAttributes main_thread_attrib;
   exit(retval);
 }
 
-} // namespace LIBC_NAMESPACE
+} // namespace LIBC_NAMESPACE_DECL

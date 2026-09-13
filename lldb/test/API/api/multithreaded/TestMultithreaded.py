@@ -8,20 +8,14 @@ from lldbsuite.test.lldbtest import *
 from lldbsuite.test import lldbutil
 
 
+@requireThreadSupport
 @skipIfNoSBHeaders
 class SBBreakpointCallbackCase(TestBase):
+    SHARED_BUILD_TESTCASE = False
     NO_DEBUG_INFO_TESTCASE = True
 
     def setUp(self):
         TestBase.setUp(self)
-        self.generateSource("driver.cpp")
-        self.generateSource("listener_test.cpp")
-        self.generateSource("test_breakpoint_callback.cpp")
-        self.generateSource("test_breakpoint_location_callback.cpp")
-        self.generateSource("test_listener_event_description.cpp")
-        self.generateSource("test_listener_event_process_state.cpp")
-        self.generateSource("test_listener_resume.cpp")
-        self.generateSource("test_stop-hook.cpp")
 
     @skipIfRemote
     # clang-cl does not support throw or catch (llvm.org/pr24538)
@@ -91,7 +85,19 @@ class SBBreakpointCallbackCase(TestBase):
             "test_listener_resume",
         )
 
-    def build_and_test(self, sources, test_name, args=None):
+    @skipIfRemote
+    # clang-cl does not support throw or catch (llvm.org/pr24538)
+    @skipIfWindows
+    @skipIfHostIncompatibleWithTarget
+    def test_concurrent_unwind(self):
+        """Test that you can run a python command in a stop-hook when stdin is File based."""
+        self.build_and_test(
+            "driver.cpp test_concurrent_unwind.cpp",
+            "test_concurrent_unwind",
+            inferior_source="deep_stack.cpp",
+        )
+
+    def build_and_test(self, sources, test_name, inferior_source="inferior.cpp"):
         """Build LLDB test from sources, and run expecting 0 exit code"""
 
         # These tests link against host lldb API.
@@ -104,7 +110,7 @@ class SBBreakpointCallbackCase(TestBase):
             )
 
         self.inferior = "inferior_program"
-        self.buildProgram("inferior.cpp", self.inferior)
+        self.buildProgram(inferior_source, self.inferior)
         self.addTearDownHook(lambda: os.remove(self.getBuildArtifact(self.inferior)))
 
         self.buildDriver(sources, test_name)
@@ -113,10 +119,15 @@ class SBBreakpointCallbackCase(TestBase):
         test_exe = self.getBuildArtifact(test_name)
         exe = [test_exe, self.getBuildArtifact(self.inferior)]
 
+        # Tests locate their support files (e.g. test_stop-hook.cpp's
+        # some_cmd.py) via the LLDB_TEST_SOURCE_DIR environment variable.
+        env = dict(os.environ)
+        env["LLDB_TEST_SOURCE_DIR"] = self.getSourceDir()
+
         # check_call will raise a CalledProcessError if the executable doesn't
         # return exit code 0 to indicate success.  We can let this exception go
         # - the test harness will recognize it as a test failure.
-        subprocess.check_call(exe)
+        subprocess.check_call(exe, env=env)
 
     def build_program(self, sources, program):
         return self.buildDriver(sources, program)
